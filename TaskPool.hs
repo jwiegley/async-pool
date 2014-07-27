@@ -179,6 +179,7 @@ sequenceTasks p parent child = do
             -- exit status, or it has finished entirely.  Whatever the
             -- case, we must ensure that the child does not execute until
             -- termination of the parent if it is executing.
+            -- jww (2014-07-26): TODO
             return ()
 
 submitDependentTask :: Pool -> Task -> Handle -> STM Handle
