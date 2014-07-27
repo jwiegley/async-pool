@@ -8,19 +8,20 @@ module TaskPool
     , submitTask
     , submitDependentTask
     , cancelTask
-    , waitOnTask
-    , waitOnTaskEither
+    , waitTask
+    , waitTaskEither
     , pollTask
     , pollTaskEither
+    , main
     ) where
 
 import           Control.Applicative hiding (empty)
-import           Control.Concurrent (threadDelay)
+import           Control.Concurrent (threadDelay, newMVar, takeMVar, putMVar)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Lens
-import           Control.Monad (when)
+import           Control.Monad (when, void)
 import           Data.Foldable
 import           Data.Graph.Inductive.Graph as Gr hiding ((&))
 import           Data.Graph.Inductive.PatriciaTree
@@ -162,12 +163,23 @@ submitTask p t = do
     modifyTVar (p^.tasks) (insNode (h, t))
     return h
 
+-- | Given parent and child task handles, link them so that the child
+--   cannot execute until the parent has finished.
 sequenceTasks :: Pool
               -> Handle          -- ^ Task to depend on (parent)
               -> Handle          -- ^ Task that depends (child)
               -> STM ()
-sequenceTasks p parent child =
-    modifyTVar (p^.tasks) (insEdge (parent, child, ()))
+sequenceTasks p parent child = do
+    g <- readTVar (p^.tasks)
+    if gelem parent g
+        then modifyTVar (p^.tasks) (insEdge (parent, child, ()))
+        else do
+            -- If the parent is no longer in the graph, either it is
+            -- currently executing, or it is pending examination of the
+            -- exit status, or it has finished entirely.  Whatever the
+            -- case, we must ensure that the child does not execute until
+            -- termination of the parent if it is executing.
+            return ()
 
 submitDependentTask :: Pool -> Task -> Handle -> STM Handle
 submitDependentTask p t parent = do
@@ -207,28 +219,29 @@ pollTask p h = do
         Just (Right x) -> return $ Just x
         Nothing        -> return Nothing
 
-waitOnTaskEither :: Pool -> Handle -> STM (Either SomeException ())
-waitOnTaskEither p h = do
+waitTaskEither :: Pool -> Handle -> STM (Either SomeException ())
+waitTaskEither p h = do
     mres <- pollTaskEither p h
     case mres of
         Nothing -> retry
         Just x  -> return x
 
-waitOnTask :: Pool -> Handle -> STM ()
-waitOnTask p h = do
-    mres <- waitOnTaskEither p h
+waitTask :: Pool -> Handle -> STM ()
+waitTask p h = do
+    mres <- waitTaskEither p h
     case mres of
         Left e  -> throw e
         Right x -> return x
 
 main :: IO ()
 main = do
-    p <- createPool 16
+    p <- createPool 4
+    sync <- newMVar ()
     hs <- forM [(1 :: Int) .. 30] $ \h ->
-        atomically $ submitTask p $ putStrLn $ "Task " ++ show h
-    _ <- forM_ [(1 :: Int) .. 5] $ const $ do
-        putStrLn "Polling tasks..."
-        mapM_ ((try :: IO a -> IO (Either SomeException a))
-                   . atomically . pollTaskEither p) hs
-        threadDelay 1000000
+        atomically $ submitTask p $ do
+            threadDelay ((h `mod` 4) * 100000)
+            takeMVar sync
+            putStrLn $ "Task " ++ show h
+            putMVar sync ()
+    forM_ hs $ void . atomically . waitTask p
     putStrLn "All done"
