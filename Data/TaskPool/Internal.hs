@@ -17,7 +17,7 @@ import           Data.Maybe (mapMaybe)
 import           Data.Monoid
 import           Data.Traversable
 -- import           Debug.Trace
-import           Prelude hiding (mapM_, mapM, foldr, all, concatMap)
+import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap)
 
 -- | A 'Handle' is a unique reference to a task that has submitted to a
 --   'Pool'.
@@ -46,18 +46,39 @@ data Status = Pending | Completed deriving (Eq, Show)
 --   unscheduled.
 data Pool a = Pool
     { slots  :: TVar Int
+      -- ^ The total number of execution slots in the pool.  If nothing is
+      --   running, this is also the number of available slots.  This can be
+      --   changed dynamically using 'setPoolSlots'.
     , avail  :: TVar Int
+      -- ^ The number of available execution slots in the pool.
     , procs  :: TVar (IntMap (Async a))
+      -- ^ The active or completed process table.  For every task running in a
+      --   thread, this holds the Async value governing that thread; for every
+      --   completed task, it holds the Async value that records its
+      --   completion value or exception status.  These entries are inserted
+      --   whenever a thread is started, and are cleared by ultimately calling
+      --   'pollTaskEither' (which all the other polling and waiting functions
+      --   also call).
+      --
+      --   Note that submitting a task with 'submitTask_' or
+      --   'submitDependentTask_' will remove the thread's Async value
+      --   immediately at the end of the task, causing it to be garbage
+      --   collected.
     , tasks  :: TVar (TaskGraph a)
-      -- ^ A task graph represents a partially ordered set P with subset
-      --   S such that for every x ∈ S and y ∈ P, either x ≤ y or x is
-      --   unrelated to y.  S is therefore the set of all tasks which
-      --   may execute concurrently.
+      -- ^ The task graph represents a partially ordered set P with subset S
+      --   such that for every x ∈ S and y ∈ P, either x ≤ y or x is unrelated
+      --   to y.  Stated more simply, S is the set of least elements of all
+      --   maximal chains in P.  In our case, ≤ relates two uncompleted tasks
+      --   by dependency.  Therefore, S is equal to the set of tasks which may
+      --   execute concurrently, as none of them have incomplete dependencies.
       --
       --   We use a graph representation to make determination of S more
-      --   efficient, and to record completion of parents in the graph
-      --   structure.
+      --   efficient (where S is just the set of roots in P expressed as a
+      --   graph).  Completion status is recorded on the edges, and nodes are
+      --   removed from the graph once no other incomplete node depends on
+      --   them.
     , tokens :: TVar Int
+      -- ^ Tokens identify tasks, and are provisioned monotonically.
     }
 
 -- | Return a list of unlabeled nodes ready for execution.  This
@@ -75,9 +96,15 @@ getReadyNodes p g = do
     modifyTVar (avail p) (\x -> x - length readyNodes)
     return readyNodes
   where
-    -- | Returns True for every node in the graph which has either no
-    --   dependencies, or no incomplete dependencies.
-    isReady x = all (\(_,_,y) -> y == Completed) (inn g x)
+    -- | Returns True for every node for which there are no dependencies or
+    --   incomplete dependencies, and which is not itself a completed
+    --   dependency.  The reason for the latter condition is that we keep
+    --   completed nodes with dependents in graph until their dependents have
+    --   completed (recursively), so that the dependent knows only to begin
+    --   when its parent has truly finished -- a fact which cannot be
+    --   determined using only the process map.
+    isCompleted (_,_,y) = y == Completed
+    isReady x = all isCompleted (inn g x) && not (any isCompleted (out g x))
 
 -- | Given a task handle, return everything we know about that task.
 getTaskInfo :: TaskGraph a -> Handle -> TaskInfo a
@@ -94,22 +121,19 @@ getReadyTasks p = do
 --   determines how many threads may execute concurrently.  This number
 --   is adjustable dynamically, by calling 'setPoolSlots', though
 --   reducing it does not cause already active threads to stop.
---
---   Note: Setting the number of available slots to zero has the effect
---   of causing this function to exit soon after, so that 'runPool' will
---   need to be called again to continue processing tasks in the 'Pool'.
 runPool :: Pool a -> IO ()
-runPool p = do
-    cnt <- atomically $ readTVar (slots p)
-    when (cnt > 0) $ do
-        ready <- atomically $ getReadyTasks p
-        -- unless (null ready) $
-        --     trace ("Ready tasks: " ++ show ready) $ return ()
-        xs <- forM ready $ \ti ->
-            (,) <$> pure ti <*> startTask p ti
-        atomically $ modifyTVar (procs p) $ \ms ->
-            foldl' (\m ((h, _), x) -> IntMap.insert h x m) ms xs
-        runPool p
+runPool p = forever $ do
+    ready <- atomically $ do
+        cnt <- readTVar (slots p)
+        check (cnt > 0)
+        ready <- getReadyTasks p
+        check (not (null ready))
+        return ready
+    -- unless (null ready) $
+    --     trace ("Ready tasks: " ++ show ready) $ return ()
+    xs <- forM ready $ \ti -> (,) <$> pure ti <*> startTask p ti
+    atomically $ modifyTVar (procs p) $ \ms ->
+        foldl' (\m ((h, _), x) -> IntMap.insert h x m) ms xs
 
 -- | Start a task within the given pool.  This begins execution as soon
 --   as the runtime is able to.
@@ -204,6 +228,24 @@ submitTask p action = do
     modifyTVar (tasks p) (insNode (h, Task action))
     return h
 
+-- | Submit an 'IO ()' action, where we will never care about the result value
+--   or if an exception occurred within the task.  This means its process
+--   table entry is automatically cleared immediately upon completion of the
+--   task.  Use this if you are doing your own result propagation, such as
+--   writing to a 'TChan' within the task.
+submitTask_ :: Pool a -> IO a -> STM Handle
+submitTask_ p action = do
+    v <- newEmptyTMVar
+    h <- submitTask p (go v)
+    putTMVar v h
+    return h
+  where
+    go v = do
+        res <- action
+        atomically $ do
+            h <- takeTMVar v
+            res <$ modifyTVar (procs p) (IntMap.delete h)
+
 -- | Given parent and child task handles, link them so that the child
 --   cannot execute until the parent has finished.
 sequenceTasks :: Pool a
@@ -225,6 +267,14 @@ sequenceTasks p parent child = do
 submitDependentTask :: Pool a -> Handle -> IO a -> STM Handle
 submitDependentTask p parent t = do
     child <- submitTask p t
+    sequenceTasks p parent child
+    return child
+
+-- | Submit a dependent task where we do not care about the result value or if
+--   an exception occurred.  See 'submitTask_'.
+submitDependentTask_ :: Pool a -> Handle -> IO a -> STM Handle
+submitDependentTask_ p parent t = do
+    child <- submitTask_ p t
     sequenceTasks p parent child
     return child
 

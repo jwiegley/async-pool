@@ -8,7 +8,9 @@ module Data.TaskPool
     , cancelAll
 
     , submitTask
+    , submitTask_
     , submitDependentTask
+    , submitDependentTask_
     , cancelTask
     , sequenceTasks
 
