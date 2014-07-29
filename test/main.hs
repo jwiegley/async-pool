@@ -7,7 +7,7 @@ import           Control.Exception
 import           Control.Monad
 import           Data.Graph.Inductive.Graph as Gr
 import qualified Data.IntMap as M
-import           Data.TaskPool
+import           Data.TaskPool.Internal
 import           Test.Hspec
 
 testAvail p x = do
