@@ -7,7 +7,7 @@ import           Control.Applicative hiding (empty)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
-import           Control.Monad hiding (forM, mapM_)
+import           Control.Monad hiding (forM, forM_, mapM, mapM_)
 import           Data.Foldable
 import           Data.Graph.Inductive.Graph as Gr hiding ((&))
 import           Data.Graph.Inductive.PatriciaTree
@@ -329,10 +329,69 @@ waitTask p h = do
         Right x -> return x
 
 -- | Run a group of up to N tasks at a time concurrently, returning the
---   results in order.  Note that the order of actual execution is random.
-mapTasks :: Int -> [IO a] -> IO [a]
-mapTasks n fs = do
+--   results in order.  The order of execution is random, but the results are
+--   returned in order.
+mapTasks' :: Traversable t
+          => Int
+          -> t (IO a)
+          -> (IO (t b) -> IO (t c))
+          -> (Pool a -> Handle -> STM b)
+          -> IO (t c)
+mapTasks' n fs f g = do
     p <- createPool n
     link =<< async (runPool p)
     hs <- forM fs $ atomically . submitTask p
-    forM hs $ atomically . waitTask p
+    f $ forM hs $ atomically . g p
+
+-- | Run a group of up to N tasks at a time concurrently, returning the
+--   results in order.  The order of execution is random, but the results are
+--   returned in order.
+mapTasks :: Traversable t => Int -> t (IO a) -> IO (t a)
+mapTasks n fs = mapTasks' n fs id waitTask
+
+-- | Run a group of up to N tasks at a time concurrently, returning the
+--   results in order.  The order of execution is random, but the results are
+--   returned in order.
+mapTasksE :: Traversable t => Int -> t (IO a) -> IO (t (Either SomeException a))
+mapTasksE n fs = mapTasks' n fs id waitTaskEither
+
+-- | Run a group of up to N tasks at a time concurrently, ignoring the
+--   results.
+mapTasks_ :: Foldable t => Int -> t (IO a) -> IO ()
+mapTasks_ n fs = do
+    p <- createPool n
+    link =<< async (runPool p)
+    forM_ fs $ atomically . submitTask_ p
+
+-- | Run a group of up to N tasks at a time concurrently, ignoring the
+--   results, but returning whether an exception occurred for each task.
+mapTasksE_ :: Traversable t => Int -> t (IO a) -> IO (t (Maybe SomeException))
+mapTasksE_ n fs = mapTasks' n fs (fmap (fmap leftToMaybe)) waitTaskEither
+  where
+    leftToMaybe :: Either a b -> Maybe a
+    leftToMaybe = either Just (const Nothing)
+
+-- | Execute a group of tasks (where only N tasks at most may run,
+--   corresponding to the number of available slots in the pool), returning
+--   the first result or failure.  'Nothing' is returned if no tasks were
+--   provided.
+mapTasksRace :: Traversable t
+             => Int -> t (IO a) -> IO (Maybe (Either SomeException a))
+mapTasksRace n fs = do
+    p <- createPool n
+    link =<< async (runPool p)
+    forM_ fs $ atomically . submitTask p
+    g <- atomically $ readTVar (tasks p)
+    if Gr.isEmpty g
+        then return Nothing
+        else loopM p
+  where
+    loopM p = do
+        ps <- atomically $ do
+            ps <- readTVar (procs p)
+            check (not (IntMap.null ps))
+            return ps
+        let as = IntMap.assocs ps
+        (_, eres) <- waitAnyCatchCancel (map snd as)
+        cancelAll p
+        return $ Just eres

@@ -18,6 +18,12 @@ module Data.TaskPool
     , waitTaskEither
     , pollTask
     , pollTaskEither
+
+    , mapTasks
+    , mapTasksE
+    , mapTasks_
+    , mapTasksE_
+    , mapTasksRace
     ) where
 
 import Data.TaskPool.Internal
