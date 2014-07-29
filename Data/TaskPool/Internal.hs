@@ -32,15 +32,15 @@ instance Show (Task a) where
 
 data Status = Pending | Completed deriving (Eq, Show)
 
--- | A 'Pool' manages a collection of possibly interdependent tasks,
---   such that tasks await execution until the tasks they depend on have
---   finished (and tasks may depend on an arbitrary number of other
---   tasks), while independent tasks execute concurrently up to the
---   number of available resource slots in the pool.
+-- | A 'Pool' manages a collection of possibly interdependent tasks, such that
+--   tasks await execution until the tasks they depend on have finished (and
+--   tasks may depend on an arbitrary number of other tasks), while
+--   independent tasks execute concurrently up to the number of available
+--   resource slots in the pool.
 --
---   Results from each task are available until the status of the task
---   is polled or waited on.  Further, the results are kept until that
---   occurs, so failing to ever wait will result in a memory leak.
+--   Results from each task are available until the status of the task is
+--   polled or waited on.  Further, the results are kept until that occurs, so
+--   failing to ever wait will result in a memory leak.
 --
 --   Tasks may be cancelled, in which case all dependent tasks are
 --   unscheduled.
@@ -81,9 +81,8 @@ data Pool a = Pool
       -- ^ Tokens identify tasks, and are provisioned monotonically.
     }
 
--- | Return a list of unlabeled nodes ready for execution.  This
---   decreases the number of available slots, but does not remove the
---   nodes from the graph.
+-- | Return a list of unlabeled nodes ready for execution.  This decreases the
+--   number of available slots, but does not remove the nodes from the graph.
 getReadyNodes :: Pool a -> TaskGraph a -> STM [Node]
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
@@ -103,24 +102,26 @@ getReadyNodes p g = do
     --   completed (recursively), so that the dependent knows only to begin
     --   when its parent has truly finished -- a fact which cannot be
     --   determined using only the process map.
-    isCompleted (_,_,y) = y == Completed
     isReady x = all isCompleted (inn g x) && not (any isCompleted (out g x))
+
+    isCompleted (_,_,Completed) = True
+    isCompleted (_,_,_)         = False
 
 -- | Given a task handle, return everything we know about that task.
 getTaskInfo :: TaskGraph a -> Handle -> TaskInfo a
 getTaskInfo g h = let (_toNode, _, t, _fromNode) = context g h in (h, t)
 
--- | Return information about the list of tasks ready to execute,
---   sufficient to start them and remove them from the graph afterwards.
+-- | Return information about the list of tasks ready to execute, sufficient
+--   to start them and remove them from the graph afterwards.
 getReadyTasks :: Pool a -> STM [TaskInfo a]
 getReadyTasks p = do
     g <- readTVar (tasks p)
     map (getTaskInfo g) <$> getReadyNodes p g
 
--- | Begin executing tasks in the given pool.  The number of slots
---   determines how many threads may execute concurrently.  This number
---   is adjustable dynamically, by calling 'setPoolSlots', though
---   reducing it does not cause already active threads to stop.
+-- | Begin executing tasks in the given pool.  The number of slots determines
+--   how many threads may execute concurrently.  This number is adjustable
+--   dynamically, by calling 'setPoolSlots', though reducing it does not cause
+--   already active threads to stop.
 runPool :: Pool a -> IO ()
 runPool p = forever $ do
     ready <- atomically $ do
@@ -135,8 +136,8 @@ runPool p = forever $ do
     atomically $ modifyTVar (procs p) $ \ms ->
         foldl' (\m ((h, _), x) -> IntMap.insert h x m) ms xs
 
--- | Start a task within the given pool.  This begins execution as soon
---   as the runtime is able to.
+-- | Start a task within the given pool.  This begins execution as soon as the
+--   runtime is able to.
 startTask :: Pool a -> TaskInfo a -> IO (Async a)
 startTask p (h, Task go) = async $ finally go $ atomically $ do
     ss <- readTVar (slots p)
@@ -146,10 +147,9 @@ startTask p (h, Task go) = async $ finally go $ atomically $ do
     -- dependent children will know their parent has completed.
     modifyTVar (tasks p) $ \g ->
         case zip (repeat h) (Gr.suc g h) of
-            -- If nothing dependend on this task, prune it from the
-            -- graph, as well as any parents which now have no
-            -- dependents.  Otherwise, mark the edges as Completed so
-            -- dependent children can execute.
+            -- If nothing dependend on this task, prune it from the graph, as
+            -- well as any parents which now have no dependents.  Otherwise,
+            -- mark the edges as Completed so dependent children can execute.
             [] -> dropTask h g
             es -> insEdges (completeEdges es) $ delEdges es g
   where
@@ -159,9 +159,8 @@ startTask p (h, Task go) = async $ finally go $ atomically $ do
       where
         f g n = if outdeg g n == 0 then dropTask n g else g
 
--- | Create a thread pool for executing interdependent tasks
---   concurrently.  The number of available slots governs how many tasks
---   may run at one time.
+-- | Create a thread pool for executing interdependent tasks concurrently.
+--   The number of available slots governs how many tasks may run at one time.
 createPool :: Int                -- ^ Maximum number of running tasks.
            -> IO (Pool a)
 createPool cnt = atomically $
@@ -173,8 +172,8 @@ createPool cnt = atomically $
 
 -- | Set the number of available execution slots in the given 'Pool'.
 --   Increasing the number will cause waiting threads to start executing
---   immediately, while decreasing the number only decreases any
---   available slots -- it does not cancel already executing threads.
+--   immediately, while decreasing the number only decreases any available
+--   slots -- it does not cancel already executing threads.
 setPoolSlots :: Pool a -> Int -> STM ()
 setPoolSlots p n = do
     ss <- readTVar (slots p)
@@ -182,8 +181,8 @@ setPoolSlots p n = do
     modifyTVar (avail p) (\x -> max 0 (x + diff))
     writeTVar (slots p) (max 0 n)
 
--- | Cancel every running thread in the pool and unschedule any that had
---   not begun yet.
+-- | Cancel every running thread in the pool and unschedule any that had not
+--   begun yet.
 cancelAll :: Pool a -> IO ()
 cancelAll p = (mapM_ cancel =<<) $ atomically $ do
     writeTVar (tasks p) Gr.empty
@@ -191,8 +190,8 @@ cancelAll p = (mapM_ cancel =<<) $ atomically $ do
     writeTVar (procs p) mempty
     return xs
 
--- | Cancel a task submitted to the pool.  This will unschedule it if it
---   had not begun yet, or cancel its thread if it had.
+-- | Cancel a task submitted to the pool.  This will unschedule it if it had not
+--   begun yet, or cancel its thread if it had.
 cancelTask :: Pool a -> Handle -> IO ()
 cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
     g <- readTVar (tasks p)
@@ -210,18 +209,18 @@ cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
     nodeList :: TaskGraph a -> Node -> [Node]
     nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
 
--- | Return the next available thread identifier from the pool.  These
---   are monotonically increasing integers.
+-- | Return the next available thread identifier from the pool.  These are
+--   monotonically increasing integers.
 nextIdent :: Pool a -> STM Int
 nextIdent p = do
     tok <- readTVar (tokens p)
     writeTVar (tokens p) (succ tok)
     return tok
 
--- | Submit an 'IO' action for execution within the managed thread pool.
---   When it actually begins executes is determined by the number of
---   available slots, whether the threaded runtime is being used, and
---   how long it takes the jobs before it to complete.
+-- | Submit an 'IO' action for execution within the managed thread pool.  When
+--   it actually begins executes is determined by the number of available
+--   slots, whether the threaded runtime is being used, and how long it takes
+--   the jobs before it to complete.
 submitTask :: Pool a -> IO a -> STM Handle
 submitTask p action = do
     h <- nextIdent p
@@ -246,24 +245,22 @@ submitTask_ p action = do
             h <- takeTMVar v
             res <$ modifyTVar (procs p) (IntMap.delete h)
 
--- | Given parent and child task handles, link them so that the child
---   cannot execute until the parent has finished.
+-- | Given parent and child task handles, link them so that the child cannot
+--   execute until the parent has finished.
 sequenceTasks :: Pool a
               -> Handle          -- ^ Task we must wait on (the parent)
               -> Handle          -- ^ Task doing the waiting
               -> STM ()
 sequenceTasks p parent child = do
     g <- readTVar (tasks p)
-    -- If the parent is no longer in the graph, there is no need to
-    -- establish a dependency.  The child can begin executing in the
-    -- next free slot.
+    -- If the parent is no longer in the graph, there is no need to establish
+    -- a dependency.  The child can begin executing in the next free slot.
     when (gelem parent g) $
         modifyTVar (tasks p) (insEdge (parent, child, Pending))
 
--- | Submit a task, but only allow it begin executing once its parent
---   task has completed.  This is equivalent to submitting a new task
---   and linking it to its parent using 'sequenceTasks' within a single
---   STM transaction.
+-- | Submit a task, but only allow it begin executing once its parent task has
+--   completed.  This is equivalent to submitting a new task and linking it to
+--   its parent using 'sequenceTasks' within a single STM transaction.
 submitDependentTask :: Pool a -> Handle -> IO a -> STM Handle
 submitDependentTask p parent t = do
     child <- submitTask p t
@@ -278,9 +275,8 @@ submitDependentTask_ p parent t = do
     sequenceTasks p parent child
     return child
 
--- | Poll the given task, returning 'Nothing' if it hasn't started yet
---   or is currently executing, and a 'Just' value if a final result is
---   known.
+-- | Poll the given task, returning 'Nothing' if it hasn't started yet or is
+--   currently executing, and a 'Just' value if a final result is known.
 pollTaskEither :: Pool a -> Handle -> STM (Maybe (Either SomeException a))
 pollTaskEither p h = do
     ps <- readTVar (procs p)
@@ -289,16 +285,16 @@ pollTaskEither p h = do
             -- First check if this is a currently executing task
             mres <- pollSTM t
             case mres of
-                -- Task handles are removed when the user has inspected
-                -- their contents.  Otherwise, they remain in the table
-                -- as zombies, just as happens on Unix.
+                -- Task handles are removed when the user has inspected their
+                -- contents.  Otherwise, they remain in the table as zombies,
+                -- just as happens on Unix.
                 Just _  -> modifyTVar (procs p) (IntMap.delete h)
                 Nothing -> return ()
             return mres
 
         Nothing -> do
-            -- If not, see if it's a pending task.  If not, do not wait at
-            -- all because it will never start!
+            -- If not, see if it's a pending task.  If not, do not wait at all
+            -- because it will never start!
             g <- readTVar (tasks p)
             return $ if gelem h g
                      then Nothing
@@ -323,8 +319,8 @@ waitTaskEither p h = do
         Nothing -> retry
         Just x  -> return x
 
--- | Wait until the given task is completed, but re-raise any exceptions
---   that were raised in the task's thread.
+-- | Wait until the given task is completed, but re-raise any exceptions that
+--   were raised in the task's thread.
 waitTask :: Pool a -> Handle -> STM a
 waitTask p h = do
     mres <- waitTaskEither p h
@@ -333,8 +329,7 @@ waitTask p h = do
         Right x -> return x
 
 -- | Run a group of up to N tasks at a time concurrently, returning the
---   results in order.  Note that the order of actual execution is
---   random.
+--   results in order.  Note that the order of actual execution is random.
 mapTasks :: Int -> [IO a] -> IO [a]
 mapTasks n fs = do
     p <- createPool n
