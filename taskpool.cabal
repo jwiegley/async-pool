@@ -33,12 +33,15 @@ test-suite test
     default-language: Haskell2010
     main-is: main.hs
     type: exitcode-stdio-1.0
-    ghc-options: -Wall -threaded
+    ghc-options: -threaded -with-rtsopts "-N2"
     build-depends:
         base
       , taskpool
       , async
       , stm
+      , transformers
+      , fgl
+      , containers
       , hspec                >= 1.4
 
 -- Test-suite doctests

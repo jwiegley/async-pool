@@ -2,7 +2,8 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 
 module Data.TaskPool
-    ( createPool
+    ( Pool(..)
+    , createPool
     , runPool
     , setPoolSlots
     , cancelAll
@@ -20,7 +21,7 @@ import           Control.Applicative hiding (empty)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
-import           Control.Monad (when)
+import           Control.Monad hiding (forM, mapM_)
 import           Data.Foldable
 import           Data.Graph.Inductive.Graph as Gr hiding ((&))
 import           Data.Graph.Inductive.PatriciaTree
@@ -29,12 +30,17 @@ import qualified Data.IntMap as IntMap
 import           Data.Maybe (mapMaybe)
 import           Data.Monoid
 import           Data.Traversable
+-- import           Debug.Trace
 import           Prelude hiding (mapM_, mapM, foldr, all, concatMap)
 
 type Handle = Node
-type Task a = IO a
 type TaskInfo a = (Handle, Task a)
 type TaskGraph a = Gr (Task a) Status
+
+newtype Task a = Task (IO a)
+
+instance Show (Task a) where
+    show _ = "Task"
 
 data Status = Pending | Completed deriving (Eq, Show)
 
@@ -61,6 +67,8 @@ getReadyNodes :: Pool a -> TaskGraph a -> STM [Node]
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     ps <- readTVar (procs p)
+    -- unless (null (nodes g)) $
+    --     trace ("Nodes: " ++ show (nodes g)) $ return ()
     let readyNodes = take availSlots
                    $ filter (\n -> isReady n && IntMap.notMember n ps)
                    $ nodes g
@@ -69,7 +77,7 @@ getReadyNodes p g = do
   where
     -- | Returns True for every node in the graph which has either no
     --   dependencies, or no incomplete dependencies.
-    isReady x = all (\(_,_,y) -> y == Completed) (out g x)
+    isReady x = all (\(_,_,y) -> y == Completed) (inn g x)
 
 -- | Given a task handle, return everything we need to know about that
 --   task.
@@ -97,6 +105,8 @@ runPool p = do
     cnt <- atomically $ readTVar (slots p)
     when (cnt > 0) $ do
         ready <- atomically $ getReadyTasks p
+        -- unless (null ready) $
+        --     trace ("Ready tasks: " ++ show ready) $ return ()
         xs <- forM ready $ \ti ->
             (,) <$> pure ti <*> startTask p ti
         atomically $ modifyTVar (procs p) $ \ms ->
@@ -106,14 +116,14 @@ runPool p = do
 -- | Start a task within the given pool.  This begins execution as soon
 --   as the runtime is able.
 startTask :: Pool a -> TaskInfo a -> IO (Async a)
-startTask p (h, action) = async $ finally action $ atomically $ do
+startTask p (h, Task go) = async $ finally go $ atomically $ do
     ss <- readTVar (slots p)
     modifyTVar (avail p) $ \a -> min (succ a) ss
 
     -- Once the task is done executing, we must alter the graph so any
     -- dependent children will know their parent has completed.
     modifyTVar (tasks p) $ \g ->
-        case zip (repeat h) (Gr.pre g h) of
+        case zip (repeat h) (Gr.suc g h) of
             -- If nothing dependend on this task, prune it from the
             -- graph, as well as any parents which now have no
             -- dependents.  Otherwise, mark the edges as Completed so
@@ -123,9 +133,9 @@ startTask p (h, action) = async $ finally action $ atomically $ do
   where
     completeEdges = map (\(f, t) -> (f, t, Completed))
 
-    dropTask k gr = foldl' f (delNode k gr) (Gr.suc gr k)
+    dropTask k gr = foldl' f (delNode k gr) (Gr.pre gr k)
       where
-        f g n = if indeg g n == 0 then dropTask n g else g
+        f g n = if outdeg g n == 0 then dropTask n g else g
 
 -- | Create a thread pool for executing multiple, potentionally
 --   inter-dependent tasks concurrently.
@@ -158,8 +168,7 @@ cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
     hs <- if gelem h g
           then do
               let xs = nodeList g h
-              modifyTVar (tasks p) $ \g' ->
-                  foldl' (flip delNode) g' xs
+              modifyTVar (tasks p) $ \g' -> foldl' (flip delNode) g' xs
               return xs
           else return []
     ps <- readTVar (procs p)
@@ -168,7 +177,7 @@ cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
     return ts
   where
     nodeList :: TaskGraph a -> Node -> [Node]
-    nodeList g k = k : concatMap (nodeList g) (Gr.pre g k)
+    nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
 
 nextIdent :: Pool a -> STM Int
 nextIdent p = do
@@ -176,10 +185,10 @@ nextIdent p = do
     writeTVar (tokens p) (succ tok)
     return tok
 
-submitTask :: Pool a -> Task a -> STM Handle
+submitTask :: Pool a -> IO a -> STM Handle
 submitTask p action = do
     h <- nextIdent p
-    modifyTVar (tasks p) (insNode (h, action))
+    modifyTVar (tasks p) (insNode (h, Task action))
     return h
 
 -- | Given parent and child task handles, link them so that the child
@@ -194,16 +203,13 @@ sequenceTasks p parent child = do
     -- establish a dependency.  The child can begin executing in the
     -- next free slot.
     when (gelem parent g) $
-        modifyTVar (tasks p) (insEdge (child, parent, Pending))
+        modifyTVar (tasks p) (insEdge (parent, child, Pending))
 
-submitDependentTask :: Pool a -> Task a -> Handle -> STM Handle
-submitDependentTask p t parent = do
+submitDependentTask :: Pool a -> Handle -> IO a -> STM Handle
+submitDependentTask p parent t = do
     child <- submitTask p t
     sequenceTasks p parent child
     return child
-
-removeTaskHandle :: Pool a -> Handle -> STM ()
-removeTaskHandle p = modifyTVar (procs p) . IntMap.delete
 
 pollTaskEither :: Pool a -> Handle -> STM (Maybe (Either SomeException a))
 pollTaskEither p h = do
@@ -216,7 +222,7 @@ pollTaskEither p h = do
                 -- Task handles are removed when the user has inspected
                 -- their contents.  Otherwise, they remain in the table
                 -- as zombies, just as happens on Unix.
-                Just _  -> removeTaskHandle p h
+                Just _  -> modifyTVar (procs p) (IntMap.delete h)
                 Nothing -> return ()
             return mres
 
