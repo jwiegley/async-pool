@@ -24,6 +24,8 @@ module Data.TaskPool
     , mapTasks_
     , mapTasksE_
     , mapTasksRace
+
+    , mapReduce
     ) where
 
 import Data.TaskPool.Internal

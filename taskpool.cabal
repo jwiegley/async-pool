@@ -1,5 +1,5 @@
 Name:           taskpool
-Version:        0.0.2
+Version:        0.0.3
 Synopsis:       Manage pools of possibly interdependent tasks using STM and async
 License-file:   LICENSE
 License:        MIT

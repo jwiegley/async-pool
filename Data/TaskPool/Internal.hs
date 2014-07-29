@@ -17,7 +17,8 @@ import           Data.Maybe (mapMaybe)
 import           Data.Monoid
 import           Data.Traversable
 -- import           Debug.Trace
-import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap)
+import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
+                                 foldl1)
 
 -- | A 'Handle' is a unique reference to a task that has submitted to a
 --   'Pool'.
@@ -395,3 +396,47 @@ mapTasksRace n fs = do
         (_, eres) <- waitAnyCatchCancel (map snd as)
         cancelAll p
         return $ Just eres
+
+-- | Given a list of actions yielding 'Monoid' results, execute the actions
+--   concurrently (up to N at time, based on available slots), and also
+--   mappend each pair of results concurrently as they become ready.
+--
+--   The immediate result from this function is Handle representing the final
+--   task -- dependent on all the rest -- whose value is the final, aggregate
+--   result.
+--
+--   This is equivalent to the following: @mconcat <$> mapTasks n actions@,
+--   except that intermediate results can be garbage collected as soon as
+--   they've merged.  Also, the value returned from this function is a
+--   'Handle' which may be polled until that final result is ready.
+--
+--   Lastly, if any Exception occurs, the result obtained from waiting on or
+--   polling the Handle will be one of those exceptions, but not necessarily the
+--   first or the last.
+mapReduce :: (Traversable t, Monoid a)
+          => Pool a              -- ^ Pool to execute the tasks within
+          -> t (IO a)            -- ^ Set of Monoid-yielding IO actions
+          -> STM Handle          -- ^ Returns a Handle to the final result task
+mapReduce p fs = do
+    hs <- forM fs $ submitTask p
+    case toList hs of
+        [] -> submitTask p $ return mempty
+        xs -> flip fold1M xs $ \h1 h2 -> do
+            h3 <- submitTask p $ do
+                meres <- atomically $ do
+                    eres1 <- pollTaskEither p h1
+                    eres2 <- pollTaskEither p h2
+                    case liftM2 (<>) <$> eres1 <*> eres2 of
+                        Nothing -> retry
+                        Just x  -> return x
+                case meres of
+                    Left e  -> throwIO e
+                    Right x -> return x
+            sequenceTasks p h1 h3
+            sequenceTasks p h2 h3
+            return h3
+  where
+    fold1M :: Monad m => (a -> a -> m a) -> [a] -> m a
+    fold1M _ []       = error "fold1M: non-empty list"
+    fold1M _ [x]      = return x
+    fold1M f (x:y:xs) = f x y >>= \fax -> fold1M f (fax:xs)

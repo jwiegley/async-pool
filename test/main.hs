@@ -7,6 +7,7 @@ import           Control.Exception
 import           Control.Monad
 import           Data.Graph.Inductive.Graph as Gr
 import qualified Data.IntMap as M
+import           Data.Monoid
 import           Data.TaskPool.Internal
 import           Test.Hspec
 
@@ -138,15 +139,13 @@ main = hspec $ do
 
         cancel a
 
-sample :: IO ()
-sample = do
-    p <- createPool 4
-    link =<< async (runPool p)
-
-    sync <- newMVar ()
-    hs <- forM [(1 :: Int) .. 30] $ \h -> atomically $ submitTask p $ do
-        threadDelay ((h `mod` 4) * 100000)
-        modifyMVar_ sync $ const $ putStrLn $ "Task " ++ show h
-
-    forM_ hs $ atomically . waitTask p
-    putStrLn "All done"
+  describe "map reduce" $ do
+    it "sums a group of integers" $ do
+        p <- createPool 8 :: IO (Pool (Sum Int))
+        h <- atomically $ mapReduce p $ map (return . Sum) [1..10]
+        g <- atomically $ readTVar (tasks p)
+        withAsync (runPool p) $ const $ do
+            eres <- atomically $ waitTaskEither p h
+            case eres of
+                Left e  -> throwIO e
+                Right x -> x `shouldBe` Sum 55
