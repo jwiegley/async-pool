@@ -4,7 +4,7 @@
 
 cabal.mkDerivation (self: {
   pname = "taskpool";
-  version = "0.0.1";
+  version = "0.0.2";
   src = builtins.filterSource (path: type: type != "unknown") ./.;
   buildDepends = [ async fgl stm ];
   testDepends = [ hspec ];
