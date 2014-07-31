@@ -114,7 +114,7 @@ main = hspec $ do
             threadDelay 50000
             atomically $ writeTVar x 42
             return 42
-        h2 <- atomically $ submitDependentTask p h1 $ do
+        h2 <- atomically $ submitDependentTask p [h1] $ do
             y <- atomically $ readTVar x
             return $ y + 100
 

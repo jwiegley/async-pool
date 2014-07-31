@@ -262,10 +262,10 @@ sequenceTasks p parent child = do
 -- | Submit a task, but only allow it begin executing once its parent task has
 --   completed.  This is equivalent to submitting a new task and linking it to
 --   its parent using 'sequenceTasks' within a single STM transaction.
-submitDependentTask :: Pool a -> Handle -> IO a -> STM Handle
-submitDependentTask p parent t = do
+submitDependentTask :: Pool a -> [Handle] -> IO a -> STM Handle
+submitDependentTask p parents t = do
     child <- submitTask p t
-    sequenceTasks p parent child
+    forM_ parents $ \prnt -> sequenceTasks p prnt child
     return child
 
 -- | Submit a dependent task where we do not care about the result value or if
@@ -329,6 +329,12 @@ waitTask p h = do
         Left e  -> throw e
         Right x -> return x
 
+-- | Execute an IO action, passing it a running pool with N available slots.
+withPool :: Int -> (Pool a -> IO b) -> IO b
+withPool n f = do
+    p <- createPool n
+    withAsync (runPool p) $ const $ f p
+
 -- | Run a group of up to N tasks at a time concurrently, returning the
 --   results in order.  The order of execution is random, but the results are
 --   returned in order.
@@ -338,9 +344,7 @@ mapTasks' :: Traversable t
           -> (IO (t b) -> IO (t c))
           -> (Pool a -> Handle -> STM b)
           -> IO (t c)
-mapTasks' n fs f g = do
-    p <- createPool n
-    link =<< async (runPool p)
+mapTasks' n fs f g = withPool n $ \p -> do
     hs <- forM fs $ atomically . submitTask p
     f $ forM hs $ atomically . g p
 
@@ -359,10 +363,7 @@ mapTasksE n fs = mapTasks' n fs id waitTaskEither
 -- | Run a group of up to N tasks at a time concurrently, ignoring the
 --   results.
 mapTasks_ :: Foldable t => Int -> t (IO a) -> IO ()
-mapTasks_ n fs = do
-    p <- createPool n
-    link =<< async (runPool p)
-    forM_ fs $ atomically . submitTask_ p
+mapTasks_ n fs = withPool n $ \p -> forM_ fs $ atomically . submitTask_ p
 
 -- | Run a group of up to N tasks at a time concurrently, ignoring the
 --   results, but returning whether an exception occurred for each task.
@@ -378,9 +379,7 @@ mapTasksE_ n fs = mapTasks' n fs (fmap (fmap leftToMaybe)) waitTaskEither
 --   provided.
 mapTasksRace :: Traversable t
              => Int -> t (IO a) -> IO (Maybe (Either SomeException a))
-mapTasksRace n fs = do
-    p <- createPool n
-    link =<< async (runPool p)
+mapTasksRace n fs = withPool n $ \p -> do
     forM_ fs $ atomically . submitTask p
     g <- atomically $ readTVar (tasks p)
     if Gr.isEmpty g
@@ -413,30 +412,34 @@ mapTasksRace n fs = do
 --   Lastly, if any Exception occurs, the result obtained from waiting on or
 --   polling the Handle will be one of those exceptions, but not necessarily the
 --   first or the last.
-mapReduce :: (Traversable t, Monoid a)
+mapReduce :: (Foldable t, Monoid a)
           => Pool a              -- ^ Pool to execute the tasks within
           -> t (IO a)            -- ^ Set of Monoid-yielding IO actions
           -> STM Handle          -- ^ Returns a Handle to the final result task
-mapReduce p fs = do
-    hs <- forM fs $ submitTask p
-    case toList hs of
-        [] -> submitTask p $ return mempty
-        xs -> flip fold1M xs $ \h1 h2 -> do
-            h3 <- submitTask p $ do
-                meres <- atomically $ do
-                    eres1 <- pollTaskEither p h1
-                    eres2 <- pollTaskEither p h2
-                    case liftM2 (<>) <$> eres1 <*> eres2 of
-                        Nothing -> retry
-                        Just x  -> return x
-                case meres of
-                    Left e  -> throwIO e
-                    Right x -> return x
-            sequenceTasks p h1 h3
-            sequenceTasks p h2 h3
-            return h3
+mapReduce p fs =
+    -- Submit all the tasks right away, and jobs to combine all those results.
+    -- Since we're working with a Monoid, it doesn't matter what order they
+    -- complete in, or what order we combine the results in, just as long we
+    -- each combination waits on the results it intends to combine.
+    (combineAll =<<) $ sequenceA $ foldMap ((:[]) <$> submitTask p) fs
   where
-    fold1M :: Monad m => (a -> a -> m a) -> [a] -> m a
-    fold1M _ []       = error "fold1M: non-empty list"
-    fold1M _ [x]      = return x
-    fold1M f (x:y:xs) = f x y >>= \fax -> fold1M f (fax:xs)
+    combineAll []         = submitTask p $ return mempty
+    combineAll [h]        = return h
+    combineAll (h1:h2:[]) = combine h1 h2
+    combineAll (h1:h2:hs) = do
+        h1' <- combine h1 h2
+        h2' <- combineAll hs
+        combine h1' h2'
+
+    combine h1 h2 = submitDependentTask p [h1, h2] $ do
+        meres <- atomically $ do
+            eres1 <- pollTaskEither p h1
+            eres2 <- pollTaskEither p h2
+            -- Wait until both tasks are ready, and then return the
+            -- combination of their results.
+            case liftM2 (<>) <$> eres1 <*> eres2 of
+                Nothing -> retry
+                Just x  -> return x
+        case meres of
+            Left e  -> throwIO e
+            Right x -> return x
