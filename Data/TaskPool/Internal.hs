@@ -3,6 +3,7 @@
 
 module Data.TaskPool.Internal where
 
+import           Data.Bits
 import           Control.Applicative hiding (empty)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
@@ -16,7 +17,6 @@ import qualified Data.IntMap as IntMap
 import           Data.Maybe (mapMaybe)
 import           Data.Monoid
 import           Data.Traversable
--- import           Debug.Trace
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
                                  foldl1)
 
@@ -88,8 +88,6 @@ getReadyNodes :: Pool a -> TaskGraph a -> STM [Node]
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     ps <- readTVar (procs p)
-    -- unless (null (nodes g)) $
-    --     trace ("Nodes: " ++ show (nodes g)) $ return ()
     let readyNodes = take availSlots
                    $ filter (\n -> isReady n && IntMap.notMember n ps)
                    $ nodes g
@@ -131,8 +129,6 @@ runPool p = forever $ do
         ready <- getReadyTasks p
         check (not (null ready))
         return ready
-    -- unless (null ready) $
-    --     trace ("Ready tasks: " ++ show ready) $ return ()
     xs <- forM ready $ \ti -> (,) <$> pure ti <*> startTask p ti
     atomically $ modifyTVar (procs p) $ \ms ->
         foldl' (\m ((h, _), x) -> IntMap.insert h x m) ms xs
@@ -416,30 +412,35 @@ mapReduce :: (Foldable t, Monoid a)
           => Pool a              -- ^ Pool to execute the tasks within
           -> t (IO a)            -- ^ Set of Monoid-yielding IO actions
           -> STM Handle          -- ^ Returns a Handle to the final result task
-mapReduce p fs =
+mapReduce p fs = do
     -- Submit all the tasks right away, and jobs to combine all those results.
     -- Since we're working with a Monoid, it doesn't matter what order they
     -- complete in, or what order we combine the results in, just as long we
     -- each combination waits on the results it intends to combine.
-    (combineAll =<<) $ sequenceA $ foldMap ((:[]) <$> submitTask p) fs
+    hs <- sequenceA $ foldMap ((:[]) <$> submitTask p) fs
+    case hs of
+        [] -> submitTask p $ return mempty
+        xs -> flip assocFoldl1M xs $ \h1 h2 ->
+            submitDependentTask p [h1, h2] $ do
+                meres <- atomically $ do
+                    eres1 <- pollTaskEither p h1
+                    eres2 <- pollTaskEither p h2
+                    case liftM2 (<>) <$> eres1 <*> eres2 of
+                        Nothing -> retry
+                        Just x  -> return x
+                case meres of
+                    Left e  -> throwIO e
+                    Right x -> return x
   where
-    combineAll []         = submitTask p $ return mempty
-    combineAll [h]        = return h
-    combineAll (h1:h2:[]) = combine h1 h2
-    combineAll (h1:h2:hs) = do
-        h1' <- combine h1 h2
-        h2' <- combineAll hs
-        combine h1' h2'
-
-    combine h1 h2 = submitDependentTask p [h1, h2] $ do
-        meres <- atomically $ do
-            eres1 <- pollTaskEither p h1
-            eres2 <- pollTaskEither p h2
-            -- Wait until both tasks are ready, and then return the
-            -- combination of their results.
-            case liftM2 (<>) <$> eres1 <*> eres2 of
-                Nothing -> retry
-                Just x  -> return x
-        case meres of
-            Left e  -> throwIO e
-            Right x -> return x
+    -- | Assuming the function passed is associativity, divide up the work
+    --   binary tree-wise.
+    assocFoldl1M :: Monad m => (a -> a -> m a) -> [a] -> m a
+    assocFoldl1M _ [] = error "assocFold1M: empty list"
+    assocFoldl1M _ [x] = return x
+    assocFoldl1M f [x, y] = f x y
+    assocFoldl1M f xs = case splitAt (shiftR (length xs) 1) xs of
+        ([y], zs) -> f y =<< assocFoldl1M f zs
+        (ys,  zs) -> do
+            y' <- assocFoldl1M f ys
+            z' <- assocFoldl1M f zs
+            f y' z'
