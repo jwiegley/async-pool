@@ -91,8 +91,8 @@ main = hspec $ do
 
         res <- atomically $ waitTask p h1
         res `shouldBe` 42
-        res <- atomically $ waitTask p h2
-        res `shouldBe` 43
+        res' <- atomically $ waitTask p h2
+        res' `shouldBe` 43
 
         testProcs p M.null True
 
@@ -132,8 +132,8 @@ main = hspec $ do
 
         res <- atomically $ waitTask p h1
         res `shouldBe` 42
-        res <- atomically $ waitTask p h2
-        res `shouldBe` 142
+        res' <- atomically $ waitTask p h2
+        res' `shouldBe` 142
 
         testProcs p M.null True
 
@@ -142,10 +142,15 @@ main = hspec $ do
   describe "map reduce" $ do
     it "sums a group of integers" $ do
         p <- createPool 8 :: IO (Pool (Sum Int))
+        putStrLn $ "ReinH main.hs:145.."
         h <- atomically $ mapReduce p $ map (return . Sum) [1..10]
+        putStrLn $ "ReinH main.hs:147.."
         g <- atomically $ readTVar (tasks p)
+        putStrLn $ "ReinH main.hs:149.."
         withAsync (runPool p) $ const $ do
+            putStrLn $ "ReinH main.hs:151.."
             eres <- atomically $ waitTaskEither p h
+            putStrLn $ "ReinH main.hs:153.."
             case eres of
                 Left e  -> throwIO e
                 Right x -> x `shouldBe` Sum 55

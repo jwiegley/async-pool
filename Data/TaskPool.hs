@@ -13,6 +13,7 @@ module Data.TaskPool
     , submitDependentTask_
     , cancelTask
     , sequenceTasks
+    , unsafeSequenceTasks
 
     , waitTask
     , waitTaskEither
@@ -26,6 +27,10 @@ module Data.TaskPool
     , mapTasksRace
 
     , mapReduce
+
+    , Tasks
+    , runTasks
+    , task
     ) where
 
 import Data.TaskPool.Internal

@@ -25,6 +25,7 @@ Library
       , async
       , stm
       , containers
+      , transformers
     exposed-modules:
         Data.TaskPool
         Data.TaskPool.Internal

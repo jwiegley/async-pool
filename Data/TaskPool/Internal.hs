@@ -1,17 +1,19 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Data.TaskPool.Internal where
 
-import           Data.Bits
 import           Control.Applicative hiding (empty)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Monad hiding (forM, forM_, mapM, mapM_)
+import           Control.Monad.IO.Class
 import           Data.Foldable
 import           Data.Graph.Inductive.Graph as Gr hiding ((&))
 import           Data.Graph.Inductive.PatriciaTree
+import           Data.Graph.Inductive.Query.BFS
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import           Data.Maybe (mapMaybe)
@@ -19,6 +21,7 @@ import           Data.Monoid
 import           Data.Traversable
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
                                  foldl1)
+import Debug.Trace
 
 -- | A 'Handle' is a unique reference to a task that has submitted to a
 --   'Pool'.
@@ -243,17 +246,36 @@ submitTask_ p action = do
             res <$ modifyTVar (procs p) (IntMap.delete h)
 
 -- | Given parent and child task handles, link them so that the child cannot
---   execute until the parent has finished.
-sequenceTasks :: Pool a
-              -> Handle          -- ^ Task we must wait on (the parent)
-              -> Handle          -- ^ Task doing the waiting
-              -> STM ()
-sequenceTasks p parent child = do
+--   execute until the parent has finished.  This does not check for cycles, so
+--   can add new tasks in the time it takes to add a node and an edge into the
+--   graph.
+unsafeSequenceTasks :: Pool a
+                    -> Handle    -- ^ Task doing the waiting
+                    -> Handle    -- ^ Task we must wait on (the parent)
+                    -> STM ()
+unsafeSequenceTasks p child parent = do
     g <- readTVar (tasks p)
     -- If the parent is no longer in the graph, there is no need to establish
     -- a dependency.  The child can begin executing in the next free slot.
     when (gelem parent g) $
         modifyTVar (tasks p) (insEdge (parent, child, Pending))
+
+sequenceTasks :: Pool a
+              -> Handle    -- ^ Task doing the waiting
+              -> Handle    -- ^ Task we must wait on (the parent)
+              -> STM ()
+sequenceTasks p child parent = do
+    g <- readTVar (tasks p)
+    -- Check whether the parent is in any way dependent on the child, which
+    -- would introduce a cycle.
+    case esp child parent g of
+        -- If the parent is no longer in the graph, there is no need to
+        -- establish a dependency.  The child can begin executing in the next
+        -- free slot.
+        [] -> when (gelem parent g) $
+                 modifyTVar (tasks p) (insEdge (parent, child, Pending))
+
+        _ -> error "sequenceTasks: Attempt to introduce cycle in task graph"
 
 -- | Submit a task, but only allow it begin executing once its parent task has
 --   completed.  This is equivalent to submitting a new task and linking it to
@@ -261,7 +283,7 @@ sequenceTasks p parent child = do
 submitDependentTask :: Pool a -> [Handle] -> IO a -> STM Handle
 submitDependentTask p parents t = do
     child <- submitTask p t
-    forM_ parents $ \prnt -> sequenceTasks p prnt child
+    forM_ parents $ sequenceTasks p child
     return child
 
 -- | Submit a dependent task where we do not care about the result value or if
@@ -269,7 +291,7 @@ submitDependentTask p parents t = do
 submitDependentTask_ :: Pool a -> Handle -> IO a -> STM Handle
 submitDependentTask_ p parent t = do
     child <- submitTask_ p t
-    sequenceTasks p parent child
+    sequenceTasks p child parent
     return child
 
 -- | Poll the given task, returning 'Nothing' if it hasn't started yet or is
@@ -418,29 +440,97 @@ mapReduce p fs = do
     -- complete in, or what order we combine the results in, just as long we
     -- each combination waits on the results it intends to combine.
     hs <- sequenceA $ foldMap ((:[]) <$> submitTask p) fs
-    case hs of
-        [] -> submitTask p $ return mempty
-        xs -> flip assocFoldl1M xs $ \h1 h2 ->
-            submitDependentTask p [h1, h2] $ do
-                meres <- atomically $ do
-                    eres1 <- pollTaskEither p h1
-                    eres2 <- pollTaskEither p h2
-                    case liftM2 (<>) <$> eres1 <*> eres2 of
-                        Nothing -> retry
-                        Just x  -> return x
-                case meres of
-                    Left e  -> throwIO e
-                    Right x -> return x
+    loopM hs
   where
-    -- | Assuming the function passed is associativity, divide up the work
-    --   binary tree-wise.
-    assocFoldl1M :: Monad m => (a -> a -> m a) -> [a] -> m a
-    assocFoldl1M _ [] = error "assocFold1M: empty list"
-    assocFoldl1M _ [x] = return x
-    assocFoldl1M f [x, y] = f x y
-    assocFoldl1M f xs = case splitAt (shiftR (length xs) 1) xs of
-        ([y], zs) -> f y =<< assocFoldl1M f zs
-        (ys,  zs) -> do
-            y' <- assocFoldl1M f ys
-            z' <- assocFoldl1M f zs
-            f y' z'
+    loopM hs = do
+        hs' <- squeeze hs
+        case hs' of
+            []  -> error "Egads, impossible!"
+            [x] -> return x
+            xs  -> loopM xs
+
+    squeeze []  = (:[]) <$> submitTask p (return mempty)
+    squeeze [x] = return [x]
+    squeeze (x:y:xs) = do
+        t <- submitTask p $ do
+            meres <- atomically $ do
+                -- These polls should by definition always succeed, since this
+                -- task should not even start until the results are available.
+                eres1 <- pollTaskEither p x
+                eres2 <- pollTaskEither p y
+                case liftM2 (<>) <$> eres1 <*> eres2 of
+                    Nothing -> retry
+                    Just a  -> return a
+            case meres of
+                Left e  -> throwIO e
+                Right a -> return a
+        unsafeSequenceTasks p t x
+        unsafeSequenceTasks p t y
+        case xs of
+            [] -> return [t]
+            _  -> (t :) <$> squeeze xs
+
+data DeferredTMVar a = DeferredTMVar
+    { runDeferredTMVar :: forall b. (a -> b) -> STM b }
+
+instance Functor DeferredTMVar where
+    fmap f m = DeferredTMVar (\k -> runDeferredTMVar m (k . f))
+
+instance Applicative DeferredTMVar where
+  pure a = DeferredTMVar $ \f -> return (f a)
+  DeferredTMVar m <*> DeferredTMVar n =
+      DeferredTMVar $ \f -> m (f .) <*> n id
+
+instance Monad DeferredTMVar where
+  return = pure
+  DeferredTMVar m >>= f = DeferredTMVar $ \k -> do
+      a <- m id
+      runDeferredTMVar (f a) k
+
+newtype Tasks' b a = Tasks
+    { runTasks' :: Monoid b => Pool b -> IO ([Handle], IO a) }
+
+type Tasks a = Tasks' () a
+
+runTasks :: Pool () -> Tasks a -> IO a
+runTasks pool ts = join $ snd <$> runTasks' ts pool
+
+task :: IO a -> Tasks a
+task action = Tasks $ \_ -> return ([], action)
+
+bmap :: (a -> b) -> (c -> d) -> Either a c -> Either b d
+bmap f _ (Left a)  = Left (f a)
+bmap _ g (Right c) = Right (g c)
+
+instance Functor (Tasks' b) where
+    fmap f (Tasks k) = Tasks $ fmap (fmap (fmap (liftM f))) k
+
+instance Applicative (Tasks' b) where
+    pure x = Tasks $ \_ -> return ([], return x)
+    Tasks f <*> Tasks x = Tasks $ \pool -> do
+        (fh, fa) <- f pool
+        (tf, f') <- wrap pool fh fa
+        (xh, xa) <- x pool
+        (tx, x') <- wrap pool xh xa
+        return ([tf, tx], atomically $ do
+                     f'' <- f'
+                     x'' <- x'
+                     return $ f'' x'')
+      where
+        wrap pool hs action = atomically $ do
+            mv <- newEmptyTMVar
+            t <- submitTask_ pool $ do
+                x' <- action
+                atomically $ putTMVar mv x'
+                return mempty
+            forM_ hs $ unsafeSequenceTasks pool t
+            return (t, takeTMVar mv)
+
+instance Monad (Tasks' b) where
+    return = pure
+    Tasks m >>= f = Tasks $ \pool -> do
+        (_mh, mx) <- m pool
+        mx >>= flip runTasks' pool . f
+
+instance MonadIO (Tasks' b) where
+    liftIO m = Tasks $ \_ -> return ([], m)
