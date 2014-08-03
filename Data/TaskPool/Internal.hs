@@ -21,18 +21,13 @@ import           Data.Monoid
 import           Data.Traversable
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
                                  foldl1)
-import Debug.Trace
 
 -- | A 'Handle' is a unique reference to a task that has submitted to a
 --   'Pool'.
-type Handle = Node
-type TaskInfo a = (Handle, Task a)
+type Handle      = Node
+type TaskInfo a  = (Handle, Task a)
 type TaskGraph a = Gr (Task a) Status
-
-newtype Task a = Task (IO a)
-
-instance Show (Task a) where
-    show _ = "Task"
+type Task a      = IO a
 
 data Status = Pending | Completed deriving (Eq, Show)
 
@@ -139,7 +134,7 @@ runPool p = forever $ do
 -- | Start a task within the given pool.  This begins execution as soon as the
 --   runtime is able to.
 startTask :: Pool a -> TaskInfo a -> IO (Async a)
-startTask p (h, Task go) = async $ finally go $ atomically $ do
+startTask p (h, go) = async $ finally go $ atomically $ do
     ss <- readTVar (slots p)
     modifyTVar (avail p) $ \a -> min (succ a) ss
 
@@ -224,7 +219,7 @@ nextIdent p = do
 submitTask :: Pool a -> IO a -> STM Handle
 submitTask p action = do
     h <- nextIdent p
-    modifyTVar (tasks p) (insNode (h, Task action))
+    modifyTVar (tasks p) (insNode (h, action))
     return h
 
 -- | Submit an 'IO ()' action, where we will never care about the result value
@@ -470,27 +465,7 @@ mapReduce p fs = do
             [] -> return [t]
             _  -> (t :) <$> squeeze xs
 
-data DeferredTMVar a = DeferredTMVar
-    { runDeferredTMVar :: forall b. (a -> b) -> STM b }
-
-instance Functor DeferredTMVar where
-    fmap f m = DeferredTMVar (\k -> runDeferredTMVar m (k . f))
-
-instance Applicative DeferredTMVar where
-  pure a = DeferredTMVar $ \f -> return (f a)
-  DeferredTMVar m <*> DeferredTMVar n =
-      DeferredTMVar $ \f -> m (f .) <*> n id
-
-instance Monad DeferredTMVar where
-  return = pure
-  DeferredTMVar m >>= f = DeferredTMVar $ \k -> do
-      a <- m id
-      runDeferredTMVar (f a) k
-
-newtype Tasks' b a = Tasks
-    { runTasks' :: Monoid b => Pool b -> IO ([Handle], IO a) }
-
-type Tasks a = Tasks' () a
+newtype Tasks a = Tasks { runTasks' :: Pool () -> IO ([Handle], IO a) }
 
 runTasks :: Pool () -> Tasks a -> IO a
 runTasks pool ts = join $ snd <$> runTasks' ts pool
@@ -498,24 +473,17 @@ runTasks pool ts = join $ snd <$> runTasks' ts pool
 task :: IO a -> Tasks a
 task action = Tasks $ \_ -> return ([], action)
 
-bmap :: (a -> b) -> (c -> d) -> Either a c -> Either b d
-bmap f _ (Left a)  = Left (f a)
-bmap _ g (Right c) = Right (g c)
-
-instance Functor (Tasks' b) where
+instance Functor Tasks where
     fmap f (Tasks k) = Tasks $ fmap (fmap (fmap (liftM f))) k
 
-instance Applicative (Tasks' b) where
+instance Applicative Tasks where
     pure x = Tasks $ \_ -> return ([], return x)
     Tasks f <*> Tasks x = Tasks $ \pool -> do
-        (fh, fa) <- f pool
-        (tf, f') <- wrap pool fh fa
         (xh, xa) <- x pool
         (tx, x') <- wrap pool xh xa
-        return ([tf, tx], atomically $ do
-                     f'' <- f'
-                     x'' <- x'
-                     return $ f'' x'')
+        (fh, fa) <- f pool
+        (tf, f') <- wrap pool (tx:fh) (fa <*> atomically x')
+        return ([tf], atomically f')
       where
         wrap pool hs action = atomically $ do
             mv <- newEmptyTMVar
@@ -526,11 +494,11 @@ instance Applicative (Tasks' b) where
             forM_ hs $ unsafeSequenceTasks pool t
             return (t, takeTMVar mv)
 
-instance Monad (Tasks' b) where
+instance Monad Tasks where
     return = pure
     Tasks m >>= f = Tasks $ \pool -> do
         (_mh, mx) <- m pool
         mx >>= flip runTasks' pool . f
 
-instance MonadIO (Tasks' b) where
-    liftIO m = Tasks $ \_ -> return ([], m)
+instance MonadIO Tasks where
+    liftIO = task

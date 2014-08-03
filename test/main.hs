@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 
 import           Control.Concurrent
 import           Control.Concurrent.Async
@@ -10,6 +11,9 @@ import qualified Data.IntMap as M
 import           Data.Monoid
 import           Data.TaskPool.Internal
 import           Test.Hspec
+
+instance Show (Task a) where
+    show _ = "Task"
 
 testAvail p x = do
     a <- atomically $ readTVar (avail p)
@@ -142,15 +146,10 @@ main = hspec $ do
   describe "map reduce" $ do
     it "sums a group of integers" $ do
         p <- createPool 8 :: IO (Pool (Sum Int))
-        putStrLn $ "ReinH main.hs:145.."
         h <- atomically $ mapReduce p $ map (return . Sum) [1..10]
-        putStrLn $ "ReinH main.hs:147.."
         g <- atomically $ readTVar (tasks p)
-        putStrLn $ "ReinH main.hs:149.."
         withAsync (runPool p) $ const $ do
-            putStrLn $ "ReinH main.hs:151.."
             eres <- atomically $ waitTaskEither p h
-            putStrLn $ "ReinH main.hs:153.."
             case eres of
                 Left e  -> throwIO e
                 Right x -> x `shouldBe` Sum 55
