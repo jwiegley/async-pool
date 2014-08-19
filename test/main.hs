@@ -6,6 +6,7 @@ import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Monad
+import           Data.Functor
 import           Data.Graph.Inductive.Graph as Gr
 import qualified Data.IntMap as M
 import           Data.Monoid
@@ -153,3 +154,16 @@ main = hspec $ do
             case eres of
                 Left e  -> throwIO e
                 Right x -> x `shouldBe` Sum 55
+
+  describe "scatter fold" $ do
+      it "sums in random order" $ do
+        p <- createPool 8 :: IO (Pool (Sum Int))
+        _ <- async $ runPool p
+        let go x = do
+                threadDelay (10000 * (x `mod` 3))
+                return $ Sum x
+        res <- scatterFoldM p (map go [1..20]) $ \ex ->
+            case ex of
+                Left e  -> mempty <$ print ("Hmmm... " ++ show e)
+                Right x -> return x
+        getSum res `shouldBe` 210

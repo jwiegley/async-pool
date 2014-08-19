@@ -4,12 +4,12 @@
 
 cabal.mkDerivation (self: {
   pname = "taskpool";
-  version = "0.0.3";
+  version = "0.0.4";
   src = builtins.filterSource (path: type: type != "unknown") ./.;
   buildDepends = [ async fgl stm transformers ];
-  testDepends = [ hspec ];
+  testDepends = [ async fgl hspec stm transformers ];
   meta = {
-    description = "STM/async framework for pools of possibly inter-dependent tasks";
+    description = "Manage pools of possibly interdependent tasks using STM and async";
     license = self.stdenv.lib.licenses.mit;
     platforms = self.ghc.meta.platforms;
   };

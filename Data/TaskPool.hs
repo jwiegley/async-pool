@@ -27,6 +27,7 @@ module Data.TaskPool
     , mapTasksRace
 
     , mapReduce
+    , scatterFoldM
 
     , Tasks
     , runTasks

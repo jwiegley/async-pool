@@ -16,6 +16,7 @@ import           Data.Graph.Inductive.PatriciaTree
 import           Data.Graph.Inductive.Query.BFS
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
+import           Data.List (delete)
 import           Data.Maybe (mapMaybe)
 import           Data.Monoid
 import           Data.Traversable
@@ -50,7 +51,7 @@ data Pool a = Pool
       --   changed dynamically using 'setPoolSlots'.
     , avail  :: TVar Int
       -- ^ The number of available execution slots in the pool.
-    , procs  :: TVar (IntMap (Async a))
+    , procs  :: TVar (IntMap (TMVar (Async a)))
       -- ^ The active or completed process table.  For every task running in a
       --   thread, this holds the Async value governing that thread; for every
       --   completed task, it holds the Async value that records its
@@ -126,10 +127,16 @@ runPool p = forever $ do
         check (cnt > 0)
         ready <- getReadyTasks p
         check (not (null ready))
+        ps <- readTVar (procs p)
+        ps' <- foldM (\m (h, _) ->
+                IntMap.insert <$> pure h <*> newEmptyTMVar <*> pure m)
+            ps ready
+        writeTVar (procs p) ps'
         return ready
     xs <- forM ready $ \ti -> (,) <$> pure ti <*> startTask p ti
-    atomically $ modifyTVar (procs p) $ \ms ->
-        foldl' (\m ((h, _), x) -> IntMap.insert h x m) ms xs
+    atomically $ do
+        ps <- readTVar (procs p)
+        forM_ xs $ \((h, _), x) -> putTMVar (ps IntMap.! h) x
 
 -- | Start a task within the given pool.  This begins execution as soon as the
 --   runtime is able to.
@@ -179,27 +186,29 @@ setPoolSlots p n = do
 -- | Cancel every running thread in the pool and unschedule any that had not
 --   begun yet.
 cancelAll :: Pool a -> IO ()
-cancelAll p = (mapM_ cancel =<<) $ atomically $ do
-    writeTVar (tasks p) Gr.empty
-    xs <- IntMap.elems <$> readTVar (procs p)
-    writeTVar (procs p) mempty
-    return xs
+cancelAll p = (mapM_ (cancel <=< atomically . takeTMVar) =<<) $
+    atomically $ do
+        writeTVar (tasks p) Gr.empty
+        xs <- IntMap.elems <$> readTVar (procs p)
+        writeTVar (procs p) mempty
+        return xs
 
 -- | Cancel a task submitted to the pool.  This will unschedule it if it had not
 --   begun yet, or cancel its thread if it had.
 cancelTask :: Pool a -> Handle -> IO ()
-cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
-    g <- readTVar (tasks p)
-    hs <- if gelem h g
-          then do
-              let xs = nodeList g h
-              modifyTVar (tasks p) $ \g' -> foldl' (flip delNode) g' xs
-              return xs
-          else return []
-    ps <- readTVar (procs p)
-    let ts = mapMaybe (`IntMap.lookup` ps) hs
-    writeTVar (procs p) (foldl' (flip IntMap.delete) ps hs)
-    return ts
+cancelTask p h = (mapM_ (cancel <=< atomically . takeTMVar) =<<) $
+    atomically $ do
+        g <- readTVar (tasks p)
+        hs <- if gelem h g
+              then do
+                  let xs = nodeList g h
+                  modifyTVar (tasks p) $ \g' -> foldl' (flip delNode) g' xs
+                  return xs
+              else return []
+        ps <- readTVar (procs p)
+        let ts = mapMaybe (`IntMap.lookup` ps) hs
+        writeTVar (procs p) (foldl' (flip IntMap.delete) ps hs)
+        return ts
   where
     nodeList :: TaskGraph a -> Node -> [Node]
     nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
@@ -297,14 +306,20 @@ pollTaskEither p h = do
     case IntMap.lookup h ps of
         Just t  -> do
             -- First check if this is a currently executing task
-            mres <- pollSTM t
-            case mres of
-                -- Task handles are removed when the user has inspected their
-                -- contents.  Otherwise, they remain in the table as zombies,
-                -- just as happens on Unix.
-                Just _  -> modifyTVar (procs p) (IntMap.delete h)
-                Nothing -> return ()
-            return mres
+            mv <- tryReadTMVar t
+            case mv of
+                Nothing -> return Nothing
+                Just v -> do
+                    mres <- pollSTM v
+                    case mres of
+                        Nothing -> return ()
+                        Just _ ->
+                            -- Task handles are removed when the user has
+                            -- inspected their contents.  Otherwise, they
+                            -- remain in the table as zombies, just as happens
+                            -- on Unix.
+                            modifyTVar (procs p) (IntMap.delete h)
+                    return mres
 
         Nothing -> do
             -- If not, see if it's a pending task.  If not, do not wait at all
@@ -403,9 +418,8 @@ mapTasksRace n fs = withPool n $ \p -> do
         ps <- atomically $ do
             ps <- readTVar (procs p)
             check (not (IntMap.null ps))
-            return ps
-        let as = IntMap.assocs ps
-        (_, eres) <- waitAnyCatchCancel (map snd as)
+            mapM (readTMVar . snd) (IntMap.assocs ps)
+        (_, eres) <- waitAnyCatchCancel ps
         cancelAll p
         return $ Just eres
 
@@ -482,17 +496,13 @@ instance Applicative Tasks where
         (xh, xa) <- x pool
         (tx, x') <- wrap pool xh xa
         (fh, fa) <- f pool
-        (tf, f') <- wrap pool (tx:fh) (fa <*> atomically x')
-        return ([tf], atomically f')
+        return (tx:fh, fa >>= flip fmap x')
       where
         wrap pool hs action = atomically $ do
             mv <- newEmptyTMVar
-            t <- submitTask_ pool $ do
-                x' <- action
-                atomically $ putTMVar mv x'
-                return mempty
+            t <- submitTask_ pool $ atomically . putTMVar mv =<< action
             forM_ hs $ unsafeSequenceTasks pool t
-            return (t, takeTMVar mv)
+            return (t, atomically $ takeTMVar mv)
 
 instance Monad Tasks where
     return = pure
@@ -502,3 +512,30 @@ instance Monad Tasks where
 
 instance MonadIO Tasks where
     liftIO = task
+
+-- | Execute a group of tasks concurrently (using up to N active threads,
+--   depending on the pool), and feed results to the continuation immediately
+--   as they become available, in whatever order they complete in.  That
+--   function may return a monoid value which is accumulated to yield the
+--   final result.
+scatterFoldM :: (Foldable t, Monoid b)
+             => Pool a -> t (IO a) -> (Either SomeException a -> IO b) -> IO b
+scatterFoldM p fs f = do
+    hs <- atomically $ sequenceA $ foldMap ((:[]) <$> submitTask p) fs
+    loop mempty (toList hs)
+  where
+    loop z [] = return z
+    loop z hs = do
+        (h, eres) <- atomically $ do
+            mres <- foldM go Nothing hs
+            maybe retry return mres
+        r <- f eres
+        loop (z <> r) (delete h hs)
+
+    go acc@(Just _) _ = return acc
+    go acc h = do
+        eres <- pollTaskEither p h
+        return $ case eres of
+            Nothing        -> acc
+            Just (Left e)  -> Just (h, Left e)
+            Just (Right x) -> Just (h, Right x)
