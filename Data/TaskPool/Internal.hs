@@ -5,6 +5,7 @@
 module Data.TaskPool.Internal where
 
 import           Control.Applicative hiding (empty)
+import           Control.Arrow hiding (loop)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
@@ -17,7 +18,7 @@ import           Data.Graph.Inductive.Query.BFS
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import           Data.List (delete)
-import           Data.Maybe (mapMaybe)
+import           Data.Maybe (catMaybes)
 import           Data.Monoid
 import           Data.Traversable
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
@@ -25,12 +26,29 @@ import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
 
 -- | A 'Handle' is a unique reference to a task that has submitted to a
 --   'Pool'.
-type Handle      = Node
-type TaskInfo a  = (Handle, Task a)
-type TaskGraph a = Gr (Task a) Status
-type Task a      = IO a
+type Handle    = Node
+type TaskVar a = TVar (Task a)
+
+data Task a = Ready
+            | Starting
+            | Started (Async a)
+            | Observed
+
+instance Show (Task a) where
+    show Ready       = "Ready"
+    show Starting    = "Starting"
+    show (Started _) = "Started"
+    show Observed    = "Observed"
+
 
 data Status = Pending | Completed deriving (Eq, Show)
+
+data TaskInfo a = TaskInfo
+    { tiHandle :: Handle
+    , tiVar    :: TaskVar a
+    }
+
+type TaskGraph a = Gr (TaskVar a) Status
 
 -- | A 'Pool' manages a collection of possibly interdependent tasks, such that
 --   tasks await execution until the tasks they depend on have finished (and
@@ -45,26 +63,15 @@ data Status = Pending | Completed deriving (Eq, Show)
 --   Tasks may be cancelled, in which case all dependent tasks are
 --   unscheduled.
 data Pool a = Pool
-    { slots  :: TVar Int
+    { slots :: TVar Int
       -- ^ The total number of execution slots in the pool.  If nothing is
       --   running, this is also the number of available slots.  This can be
       --   changed dynamically using 'setPoolSlots'.
-    , avail  :: TVar Int
+    , avail :: TVar Int
       -- ^ The number of available execution slots in the pool.
-    , procs  :: TVar (IntMap (TMVar (Async a)))
-      -- ^ The active or completed process table.  For every task running in a
-      --   thread, this holds the Async value governing that thread; for every
-      --   completed task, it holds the Async value that records its
-      --   completion value or exception status.  These entries are inserted
-      --   whenever a thread is started, and are cleared by ultimately calling
-      --   'pollTaskEither' (which all the other polling and waiting functions
-      --   also call).
-      --
-      --   Note that submitting a task with 'submitTask_' or
-      --   'submitDependentTask_' will remove the thread's Async value
-      --   immediately at the end of the task, causing it to be garbage
-      --   collected.
-    , tasks  :: TVar (TaskGraph a)
+    , pending :: TVar (IntMap (IO a))
+      -- ^ Collection of tasks (already nodes in the graph) waiting to start.
+    , tasks :: TVar (TaskGraph a)
       -- ^ The task graph represents a partially ordered set P with subset S
       --   such that for every x ∈ S and y ∈ P, either x ≤ y or x is unrelated
       --   to y.  Stated more simply, S is the set of least elements of all
@@ -83,14 +90,14 @@ data Pool a = Pool
 
 -- | Return a list of unlabeled nodes ready for execution.  This decreases the
 --   number of available slots, but does not remove the nodes from the graph.
-getReadyNodes :: Pool a -> TaskGraph a -> STM [Node]
+getReadyNodes :: Pool a -> TaskGraph a -> STM (IntMap (IO a))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
-    ps <- readTVar (procs p)
-    let readyNodes = take availSlots
-                   $ filter (\n -> isReady n && IntMap.notMember n ps)
-                   $ nodes g
-    modifyTVar (avail p) (\x -> x - length readyNodes)
+    taskQueue  <- readTVar (pending p)
+    let readyNodes = IntMap.fromList $ take availSlots $ IntMap.toAscList
+                   $ IntMap.filterWithKey (const . isReady) taskQueue
+    modifyTVar (avail p) (\x -> x - IntMap.size readyNodes)
+    writeTVar (pending p) (taskQueue IntMap.\\ readyNodes)
     return readyNodes
   where
     -- | Returns True for every node for which there are no dependencies or
@@ -100,21 +107,22 @@ getReadyNodes p g = do
     --   completed (recursively), so that the dependent knows only to begin
     --   when its parent has truly finished -- a fact which cannot be
     --   determined using only the process map.
-    isReady x = all isCompleted (inn g x) && not (any isCompleted (out g x))
+    isReady x = all      isCompleted  (inn g x)
+              && all (not . isCompleted) (out g x)
 
-    isCompleted (_,_,Completed) = True
-    isCompleted (_,_,_)         = False
+    isCompleted (_, _, Completed) = True
+    isCompleted (_, _, _)         = False
 
 -- | Given a task handle, return everything we know about that task.
 getTaskInfo :: TaskGraph a -> Handle -> TaskInfo a
-getTaskInfo g h = let (_toNode, _, t, _fromNode) = context g h in (h, t)
+getTaskInfo g h = let (_to, _, t, _from) = context g h in TaskInfo h t
 
 -- | Return information about the list of tasks ready to execute, sufficient
 --   to start them and remove them from the graph afterwards.
-getReadyTasks :: Pool a -> STM [TaskInfo a]
+getReadyTasks :: Pool a -> STM [(TaskInfo a, IO a)]
 getReadyTasks p = do
     g <- readTVar (tasks p)
-    map (getTaskInfo g) <$> getReadyNodes p g
+    map (first (getTaskInfo g)) . IntMap.toList <$> getReadyNodes p g
 
 -- | Begin executing tasks in the given pool.  The number of slots determines
 --   how many threads may execute concurrently.  This number is adjustable
@@ -127,33 +135,48 @@ runPool p = forever $ do
         check (cnt > 0)
         ready <- getReadyTasks p
         check (not (null ready))
-        ps <- readTVar (procs p)
-        ps' <- foldM (\m (h, _) ->
-                IntMap.insert <$> pure h <*> newEmptyTMVar <*> pure m)
-            ps ready
-        writeTVar (procs p) ps'
+        forM_ ready $ \(ti, _) -> writeTVar (tiVar ti) Starting
         return ready
-    xs <- forM ready $ \ti -> (,) <$> pure ti <*> startTask p ti
-    atomically $ do
-        ps <- readTVar (procs p)
-        forM_ xs $ \((h, _), x) -> putTMVar (ps IntMap.! h) x
+    forM_ ready $ \(ti, go) -> do
+        x <- startTask p (tiHandle ti) go
+        atomically $ modifyTVar (tiVar ti) $ \s ->
+            case s of
+                Starting -> Started x
+                _ -> error $ "runPool: unexpected state " ++ show s
 
 -- | Start a task within the given pool.  This begins execution as soon as the
 --   runtime is able to.
-startTask :: Pool a -> TaskInfo a -> IO (Async a)
-startTask p (h, go) = async $ finally go $ atomically $ do
+startTask :: Pool a -> Handle -> IO a -> IO (Async a)
+startTask p h go = async $ finally go $ atomically $ do
     ss <- readTVar (slots p)
     modifyTVar (avail p) $ \a -> min (succ a) ss
+    cleanupTask p h
 
+cleanupTask :: Pool a -> Handle -> STM ()
+cleanupTask p h = do
     -- Once the task is done executing, we must alter the graph so any
     -- dependent children will know their parent has completed.
-    modifyTVar (tasks p) $ \g ->
-        case zip (repeat h) (Gr.suc g h) of
-            -- If nothing dependend on this task, prune it from the graph, as
-            -- well as any parents which now have no dependents.  Otherwise,
-            -- mark the edges as Completed so dependent children can execute.
-            [] -> dropTask h g
-            es -> insEdges (completeEdges es) $ delEdges es g
+    g <- readTVar (tasks p)
+    case zip (repeat h) (Gr.suc g h) of
+        -- If nothing dependend on this task and if the final result value
+        -- has been observed, prune it from the graph, as well as any
+        -- parents which now have no dependents.  Otherwise mark the edges
+        -- as Completed so dependent children can execute.
+        [] -> do
+            let ti = getTaskInfo g h
+            status <- readTVar (tiVar ti)
+            case status of
+                Ready    -> error "cleanupTask: impossible"
+                Starting ->
+                    -- If we are Starting (meaning we completed faster than
+                    -- runPool could assign a Started state), or Started,
+                    -- leave the task in the graph for the user to wait on
+                    -- later.
+                    return ()
+                Started _ -> return ()
+                Observed  -> writeTVar (tasks p) (dropTask h g)
+        es -> writeTVar (tasks p) $ insEdges (completeEdges es)
+                                 $ delEdges es g
   where
     completeEdges = map (\(f, t) -> (f, t, Completed))
 
@@ -186,30 +209,38 @@ setPoolSlots p n = do
 -- | Cancel every running thread in the pool and unschedule any that had not
 --   begun yet.
 cancelAll :: Pool a -> IO ()
-cancelAll p = (mapM_ (cancel <=< atomically . takeTMVar) =<<) $
+cancelAll p = (mapM_ cancel =<<) $
     atomically $ do
+        writeTVar (pending p) IntMap.empty
+        g <- readTVar (tasks p)
+        xs <- catMaybes <$> mapM (getTaskAsync g) (nodes g)
         writeTVar (tasks p) Gr.empty
-        xs <- IntMap.elems <$> readTVar (procs p)
-        writeTVar (procs p) mempty
         return xs
+
+getTaskAsync :: TaskGraph a -> Node -> STM (Maybe (Async a))
+getTaskAsync g h = do
+    let ti = getTaskInfo g h
+    status <- readTVar (tiVar ti)
+    return $ case status of
+        Started x -> Just x
+        _ -> Nothing
 
 -- | Cancel a task submitted to the pool.  This will unschedule it if it had not
 --   begun yet, or cancel its thread if it had.
 cancelTask :: Pool a -> Handle -> IO ()
-cancelTask p h = (mapM_ (cancel <=< atomically . takeTMVar) =<<) $
-    atomically $ do
-        g <- readTVar (tasks p)
-        hs <- if gelem h g
-              then do
-                  let xs = nodeList g h
-                  modifyTVar (tasks p) $ \g' -> foldl' (flip delNode) g' xs
-                  return xs
-              else return []
-        ps <- readTVar (procs p)
-        let ts = mapMaybe (`IntMap.lookup` ps) hs
-        writeTVar (procs p) (foldl' (flip IntMap.delete) ps hs)
-        return ts
+cancelTask p h = (mapM_ cancel =<<) $ atomically $ do
+    g <- readTVar (tasks p)
+    let hs = if gelem h g then nodeList g h else []
+    xs <- foldM (go g) [] hs
+    writeTVar (tasks p) $ foldl' (flip delNode) g $ map fst xs
+    return $ map snd xs
   where
+    go g acc h' = do
+        mres <- getTaskAsync g h'
+        return $ case mres of
+            Nothing -> acc
+            Just x  -> (h', x) : acc
+
     nodeList :: TaskGraph a -> Node -> [Node]
     nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
 
@@ -228,7 +259,9 @@ nextIdent p = do
 submitTask :: Pool a -> IO a -> STM Handle
 submitTask p action = do
     h <- nextIdent p
-    modifyTVar (tasks p) (insNode (h, action))
+    modifyTVar (pending p) (IntMap.insert h action)
+    tv <- newTVar Ready
+    modifyTVar (tasks p) (insNode (h, tv))
     return h
 
 -- | Submit an 'IO ()' action, where we will never care about the result value
@@ -247,7 +280,19 @@ submitTask_ p action = do
         res <- action
         atomically $ do
             h <- takeTMVar v
-            res <$ modifyTVar (procs p) (IntMap.delete h)
+            g <- readTVar (tasks p)
+            let ti = getTaskInfo g h
+            status <- readTVar (tiVar ti)
+            case status of
+                Ready     -> error "submitTask_: impossible"
+                -- Wait until we are beyond the Starting state, otherwise any
+                -- change we make here may be overwritten.
+                Starting  -> retry
+                -- Note that this happens before the call to cleanupTask at
+                -- the end of the thread (as staged by startTask).
+                Started _ -> writeTVar (tiVar ti) Observed
+                Observed  -> return ()
+        return res
 
 -- | Given parent and child task handles, link them so that the child cannot
 --   execute until the parent has finished.  This does not check for cycles, so
@@ -302,33 +347,32 @@ submitDependentTask_ p parent t = do
 --   currently executing, and a 'Just' value if a final result is known.
 pollTaskEither :: Pool a -> Handle -> STM (Maybe (Either SomeException a))
 pollTaskEither p h = do
-    ps <- readTVar (procs p)
-    case IntMap.lookup h ps of
-        Just t  -> do
-            -- First check if this is a currently executing task
-            mv <- tryReadTMVar t
-            case mv of
-                Nothing -> return Nothing
-                Just v -> do
-                    mres <- pollSTM v
-                    case mres of
-                        Nothing -> return ()
-                        Just _ ->
-                            -- Task handles are removed when the user has
-                            -- inspected their contents.  Otherwise, they
-                            -- remain in the table as zombies, just as happens
-                            -- on Unix.
-                            modifyTVar (procs p) (IntMap.delete h)
-                    return mres
-
-        Nothing -> do
-            -- If not, see if it's a pending task.  If not, do not wait at all
-            -- because it will never start!
-            g <- readTVar (tasks p)
-            return $ if gelem h g
-                     then Nothing
-                     else Just $ Left $ toException $
-                          userError $ "Task " ++ show h ++ " unknown"
+    -- If not, see if it's a pending task.  If not, do not wait at all because
+    -- it will never start!
+    g <- readTVar (tasks p)
+    if not (gelem h g)
+        then return $ Just $ Left $ toException $ userError
+                    $ "Task " ++ show h ++ " unknown"
+        else do
+             let ti = getTaskInfo g h
+             status <- readTVar (tiVar ti)
+             case status of
+                 Observed ->
+                     return $ Just $ Left $ toException $ userError
+                            $ "Task " ++ show h ++ " already observed"
+                 Started x -> do
+                     mres <- pollSTM x
+                     case mres of
+                         Nothing -> return ()
+                         Just _ -> do
+                             -- Task handles are removed when the user has
+                             -- inspected their contents.  Otherwise, they
+                             -- remain in the table as zombies, just as happens
+                             -- on Unix.
+                             writeTVar (tiVar ti) Observed
+                             cleanupTask p h
+                     return mres
+                 _ -> return Nothing
 
 -- | Poll the given task, as with 'pollTaskEither', but re-raise any
 --   exceptions that were raised in the task's thread.
@@ -416,9 +460,10 @@ mapTasksRace n fs = withPool n $ \p -> do
   where
     loopM p = do
         ps <- atomically $ do
-            ps <- readTVar (procs p)
-            check (not (IntMap.null ps))
-            mapM (readTMVar . snd) (IntMap.assocs ps)
+            g <- readTVar (tasks p)
+            ps <- catMaybes <$> mapM (getTaskAsync g) (nodes g)
+            check (not (null ps))
+            return ps
         (_, eres) <- waitAnyCatchCancel ps
         cancelAll p
         return $ Just eres

@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 
@@ -13,7 +14,7 @@ import           Data.Monoid
 import           Data.TaskPool.Internal
 import           Test.Hspec
 
-instance Show (Task a) where
+instance Show (TaskVar a) where
     show _ = "Task"
 
 testAvail p x = do
@@ -29,8 +30,16 @@ graphPict p x = do
     prettify g `shouldBe` x
 
 testProcs p f x = do
-    ps <- atomically $ readTVar (procs p)
+    ps <- atomically $ do
+        g <- readTVar (tasks p)
+        foldM (go g) M.empty (nodes g)
     (f ps `shouldBe` x) `onException` print (M.keys ps)
+  where
+    go g acc h' = do
+        mres <- getTaskAsync g h'
+        return $ case mres of
+            Nothing -> acc
+            Just x  -> M.insert h' x acc
 
 main :: IO ()
 main = hspec $ do
@@ -46,7 +55,7 @@ main = hspec $ do
 
         -- We submit a task, so that the graph has an entry, but the process
         -- map is still empty.
-        h <- atomically $ submitTask p $ return 42
+        h <- atomically $ submitTask p $ return (42 :: Int)
         testGraph p isEmpty False
         testProcs p M.null True
 
@@ -58,15 +67,15 @@ main = hspec $ do
         -- Now the task graph should be empty, but the process map should have
         -- our completed Async in it, awaiting us to obtain the result.
         testAvail p 8
-        testGraph p isEmpty True
         testProcs p M.null False
 
         -- Wait on the task and see the result value from the task.
         res <- atomically $ waitTask p h
         res `shouldBe` 42
 
-        -- Now the process map should be empty, since observing the final
-        -- state removed the process entry from the map.
+        -- Now the task graph should be empty, since observing the final state
+        -- removed the process entry from the map.
+        testGraph p isEmpty True
         testProcs p M.null True
 
         -- Cancel the thread that was running the pool.
@@ -79,7 +88,7 @@ main = hspec $ do
         testGraph p isEmpty True
         testProcs p M.null True
 
-        h1 <- atomically $ submitTask p $ return 42
+        h1 <- atomically $ submitTask p $ return (42 :: Int)
         h2 <- atomically $ submitTask p $ return 43
 
         testGraph p isEmpty False
@@ -91,7 +100,6 @@ main = hspec $ do
         threadDelay 100000
 
         testAvail p 8
-        testGraph p isEmpty True
         testProcs p M.size 2
 
         res <- atomically $ waitTask p h1
@@ -99,6 +107,7 @@ main = hspec $ do
         res' <- atomically $ waitTask p h2
         res' `shouldBe` 43
 
+        testGraph p isEmpty True
         testProcs p M.null True
 
         cancel a
@@ -132,7 +141,6 @@ main = hspec $ do
         threadDelay 250000
 
         testAvail p 8
-        testGraph p isEmpty True
         testProcs p M.size 2
 
         res <- atomically $ waitTask p h1
@@ -140,6 +148,7 @@ main = hspec $ do
         res' <- atomically $ waitTask p h2
         res' `shouldBe` 142
 
+        testGraph p isEmpty True
         testProcs p M.null True
 
         cancel a
