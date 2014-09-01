@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
@@ -5,7 +6,6 @@
 module Data.TaskPool.Internal where
 
 import           Control.Applicative hiding (empty)
-import           Control.Arrow hiding (loop)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
@@ -21,11 +21,11 @@ import           Data.List (delete)
 import           Data.Maybe (catMaybes)
 import           Data.Monoid
 import           Data.Traversable
+import           Data.Typeable
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
                                  foldl1)
 
--- | A 'Handle' is a unique reference to a task that has submitted to a
---   'Pool'.
+-- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
 type TaskVar a = TVar (Task a)
 
@@ -40,15 +40,15 @@ instance Show (Task a) where
     show (Started _) = "Started"
     show Observed    = "Observed"
 
-
 data Status = Pending | Completed deriving (Eq, Show)
 
-data TaskInfo a = TaskInfo
-    { tiHandle :: Handle
-    , tiVar    :: TaskVar a
-    }
-
 type TaskGraph a = Gr (TaskVar a) Status
+
+data TaskException = TaskUnknown Handle
+                   | TaskAlreadyObserved Handle
+    deriving (Show, Typeable)
+
+instance Exception TaskException
 
 -- | A 'Pool' manages a collection of possibly interdependent tasks, such that
 --   tasks await execution until the tasks they depend on have finished (and
@@ -70,7 +70,7 @@ data Pool a = Pool
     , avail :: TVar Int
       -- ^ The number of available execution slots in the pool.
     , pending :: TVar (IntMap (IO a))
-      -- ^ Collection of tasks (already nodes in the graph) waiting to start.
+      -- ^ Nodes in the task graph that are waiting to start.
     , tasks :: TVar (TaskGraph a)
       -- ^ The task graph represents a partially ordered set P with subset S
       --   such that for every x ∈ S and y ∈ P, either x ≤ y or x is unrelated
@@ -96,7 +96,7 @@ getReadyNodes p g = do
     taskQueue  <- readTVar (pending p)
     let readyNodes = IntMap.fromList $ take availSlots $ IntMap.toAscList
                    $ IntMap.filterWithKey (const . isReady) taskQueue
-    modifyTVar (avail p) (\x -> x - IntMap.size readyNodes)
+    writeTVar (avail p) (availSlots - IntMap.size readyNodes)
     writeTVar (pending p) (taskQueue IntMap.\\ readyNodes)
     return readyNodes
   where
@@ -114,15 +114,16 @@ getReadyNodes p g = do
     isCompleted (_, _, _)         = False
 
 -- | Given a task handle, return everything we know about that task.
-getTaskInfo :: TaskGraph a -> Handle -> TaskInfo a
-getTaskInfo g h = let (_to, _, t, _from) = context g h in TaskInfo h t
+getTaskVar :: TaskGraph a -> Handle -> TaskVar a
+getTaskVar g h = let (_to, _, t, _from) = context g h in t
 
 -- | Return information about the list of tasks ready to execute, sufficient
 --   to start them and remove them from the graph afterwards.
-getReadyTasks :: Pool a -> STM [(TaskInfo a, IO a)]
+getReadyTasks :: Pool a -> STM [(Handle, TaskVar a, IO a)]
 getReadyTasks p = do
     g <- readTVar (tasks p)
-    map (first (getTaskInfo g)) . IntMap.toList <$> getReadyNodes p g
+    map (\(h, a) -> (h, getTaskVar g h, a)) . IntMap.toList
+        <$> getReadyNodes p g
 
 -- | Begin executing tasks in the given pool.  The number of slots determines
 --   how many threads may execute concurrently.  This number is adjustable
@@ -135,11 +136,11 @@ runPool p = forever $ do
         check (cnt > 0)
         ready <- getReadyTasks p
         check (not (null ready))
-        forM_ ready $ \(ti, _) -> writeTVar (tiVar ti) Starting
+        forM_ ready $ \(_, tv, _) -> writeTVar tv Starting
         return ready
-    forM_ ready $ \(ti, go) -> do
-        x <- startTask p (tiHandle ti) go
-        atomically $ modifyTVar (tiVar ti) $ \s ->
+    forM_ ready $ \(h, tv, go) -> do
+        x <- startTask p h go
+        atomically $ modifyTVar tv $ \s ->
             case s of
                 Starting -> Started x
                 _ -> error $ "runPool: unexpected state " ++ show s
@@ -163,8 +164,7 @@ cleanupTask p h = do
         -- parents which now have no dependents.  Otherwise mark the edges
         -- as Completed so dependent children can execute.
         [] -> do
-            let ti = getTaskInfo g h
-            status <- readTVar (tiVar ti)
+            status <- readTVar (getTaskVar g h)
             case status of
                 Ready    -> error "cleanupTask: impossible"
                 Starting ->
@@ -209,21 +209,26 @@ setPoolSlots p n = do
 -- | Cancel every running thread in the pool and unschedule any that had not
 --   begun yet.
 cancelAll :: Pool a -> IO ()
-cancelAll p = (mapM_ cancel =<<) $
-    atomically $ do
-        writeTVar (pending p) IntMap.empty
-        g <- readTVar (tasks p)
-        xs <- catMaybes <$> mapM (getTaskAsync g) (nodes g)
-        writeTVar (tasks p) Gr.empty
-        return xs
+cancelAll p = (mapM_ cancel =<<) $ atomically $ do
+    writeTVar (pending p) IntMap.empty
+    g  <- readTVar (tasks p)
+    xs <- catMaybes <$> mapM (getTaskAsync g) (nodes g)
+    writeTVar (tasks p) Gr.empty
+    return xs
 
 getTaskAsync :: TaskGraph a -> Node -> STM (Maybe (Async a))
 getTaskAsync g h = do
-    let ti = getTaskInfo g h
-    status <- readTVar (tiVar ti)
-    return $ case status of
-        Started x -> Just x
-        _ -> Nothing
+    status <- readTVar (getTaskVar g h)
+    -- If the task is in Starting state, it is about to be started in a small
+    -- amount of time, so retry until we can get the Async from the Started
+    -- state.  This allows cancellation of tasks which are just starting, but
+    -- are not yet actually started.  If we did not retry, there would be a race
+    -- condition for actions like process cancellation, since a Starting state
+    -- has no async value, but the process to produce one is already underway.
+    case status of
+        Starting -> retry
+        Started x -> return $ Just x
+        _ -> return Nothing
 
 -- | Cancel a task submitted to the pool.  This will unschedule it if it had not
 --   begun yet, or cancel its thread if it had.
@@ -281,16 +286,20 @@ submitTask_ p action = do
         atomically $ do
             h <- takeTMVar v
             g <- readTVar (tasks p)
-            let ti = getTaskInfo g h
-            status <- readTVar (tiVar ti)
+            let tv = getTaskVar g h
+            status <- readTVar tv
             case status of
                 Ready     -> error "submitTask_: impossible"
                 -- Wait until we are beyond the Starting state, otherwise any
-                -- change we make here may be overwritten.
+                -- change we make here will be overwritten.  There is only a
+                -- single line of code distance between when the task is
+                -- started, and when it gets placed into Started state, but
+                -- it's still a possibility and so we retry until the state
+                -- has been finalized as Started.
                 Starting  -> retry
-                -- Note that this happens before the call to cleanupTask at
-                -- the end of the thread (as staged by startTask).
-                Started _ -> writeTVar (tiVar ti) Observed
+                -- Note: this writeTVar happens before the call to cleanupTask
+                -- at the very end of the thread (as staged by startTask).
+                Started _ -> writeTVar tv Observed
                 Observed  -> return ()
         return res
 
@@ -337,10 +346,10 @@ submitDependentTask p parents t = do
 
 -- | Submit a dependent task where we do not care about the result value or if
 --   an exception occurred.  See 'submitTask_'.
-submitDependentTask_ :: Pool a -> Handle -> IO a -> STM Handle
-submitDependentTask_ p parent t = do
+submitDependentTask_ :: Pool a -> [Handle] -> IO a -> STM Handle
+submitDependentTask_ p parents t = do
     child <- submitTask_ p t
-    sequenceTasks p child parent
+    forM_ parents $ sequenceTasks p child
     return child
 
 -- | Poll the given task, returning 'Nothing' if it hasn't started yet or is
@@ -351,15 +360,12 @@ pollTaskEither p h = do
     -- it will never start!
     g <- readTVar (tasks p)
     if not (gelem h g)
-        then return $ Just $ Left $ toException $ userError
-                    $ "Task " ++ show h ++ " unknown"
+        then except $ TaskUnknown h
         else do
-             let ti = getTaskInfo g h
-             status <- readTVar (tiVar ti)
+             let tv = getTaskVar g h
+             status <- readTVar tv
              case status of
-                 Observed ->
-                     return $ Just $ Left $ toException $ userError
-                            $ "Task " ++ show h ++ " already observed"
+                 Observed -> except $ TaskAlreadyObserved h
                  Started x -> do
                      mres <- pollSTM x
                      case mres of
@@ -369,10 +375,12 @@ pollTaskEither p h = do
                              -- inspected their contents.  Otherwise, they
                              -- remain in the table as zombies, just as happens
                              -- on Unix.
-                             writeTVar (tiVar ti) Observed
+                             writeTVar tv Observed
                              cleanupTask p h
                      return mres
                  _ -> return Nothing
+  where
+    except = return . Just . Left . toException
 
 -- | Poll the given task, as with 'pollTaskEither', but re-raise any
 --   exceptions that were raised in the task's thread.
@@ -499,7 +507,7 @@ mapReduce p fs = do
     loopM hs = do
         hs' <- squeeze hs
         case hs' of
-            []  -> error "Egads, impossible!"
+            []  -> error "mapReduce: impossible"
             [x] -> return x
             xs  -> loopM xs
 
@@ -509,7 +517,7 @@ mapReduce p fs = do
         t <- submitTask p $ do
             meres <- atomically $ do
                 -- These polls should by definition always succeed, since this
-                -- task should not even start until the results are available.
+                -- task should not start until results are available.
                 eres1 <- pollTaskEither p x
                 eres2 <- pollTaskEither p y
                 case liftM2 (<>) <$> eres1 <*> eres2 of
@@ -518,12 +526,41 @@ mapReduce p fs = do
             case meres of
                 Left e  -> throwIO e
                 Right a -> return a
-        unsafeSequenceTasks p t x
-        unsafeSequenceTasks p t y
+        forM_ [x, y] (unsafeSequenceTasks p t)
         case xs of
             [] -> return [t]
             _  -> (t :) <$> squeeze xs
 
+-- | Execute a group of tasks concurrently (using up to N active threads,
+--   depending on the pool), and feed results to the continuation immediately
+--   as they become available, in whatever order they complete in.  That
+--   function may return a monoid value which is accumulated to yield the
+--   final result.
+scatterFoldM :: (Foldable t, Monoid b)
+             => Pool a -> t (IO a) -> (Either SomeException a -> IO b) -> IO b
+scatterFoldM p fs f = do
+    hs <- atomically $ sequenceA $ foldMap ((:[]) <$> submitTask p) fs
+    loop mempty (toList hs)
+  where
+    loop z [] = return z
+    loop z hs = do
+        (h, eres) <- atomically $ do
+            mres <- foldM go Nothing hs
+            maybe retry return mres
+        r <- f eres
+        loop (z <> r) (delete h hs)
+
+    go acc@(Just _) _ = return acc
+    go acc h = do
+        eres <- pollTaskEither p h
+        return $ case eres of
+            Nothing        -> acc
+            Just (Left e)  -> Just (h, Left e)
+            Just (Right x) -> Just (h, Right x)
+
+-- | The 'Tasks' Applicative and Monad allow for task dependencies to be built
+--   using applicative and do notation.  Monadic evaluation is sequenced,
+--   while applicative evaluation is done concurrently for each argument.
 newtype Tasks a = Tasks { runTasks' :: Pool () -> IO ([Handle], IO a) }
 
 runTasks :: Pool () -> Tasks a -> IO a
@@ -557,30 +594,3 @@ instance Monad Tasks where
 
 instance MonadIO Tasks where
     liftIO = task
-
--- | Execute a group of tasks concurrently (using up to N active threads,
---   depending on the pool), and feed results to the continuation immediately
---   as they become available, in whatever order they complete in.  That
---   function may return a monoid value which is accumulated to yield the
---   final result.
-scatterFoldM :: (Foldable t, Monoid b)
-             => Pool a -> t (IO a) -> (Either SomeException a -> IO b) -> IO b
-scatterFoldM p fs f = do
-    hs <- atomically $ sequenceA $ foldMap ((:[]) <$> submitTask p) fs
-    loop mempty (toList hs)
-  where
-    loop z [] = return z
-    loop z hs = do
-        (h, eres) <- atomically $ do
-            mres <- foldM go Nothing hs
-            maybe retry return mres
-        r <- f eres
-        loop (z <> r) (delete h hs)
-
-    go acc@(Just _) _ = return acc
-    go acc h = do
-        eres <- pollTaskEither p h
-        return $ case eres of
-            Nothing        -> acc
-            Just (Left e)  -> Just (h, Left e)
-            Just (Right x) -> Just (h, Right x)

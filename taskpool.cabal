@@ -46,6 +46,7 @@ test-suite test
       , fgl
       , containers
       , hspec                >= 1.4
+      , time
 
 -- Test-suite doctests
 --     Default-language: Haskell98

@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 
+import           Control.Applicative
 import           Control.Concurrent
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
@@ -12,6 +13,7 @@ import           Data.Graph.Inductive.Graph as Gr
 import qualified Data.IntMap as M
 import           Data.Monoid
 import           Data.TaskPool.Internal
+import           Data.Time
 import           Test.Hspec
 
 instance Show (TaskVar a) where
@@ -165,9 +167,7 @@ main = hspec $ do
                 Right x -> x `shouldBe` Sum 55
 
   describe "scatter fold" $ do
-      it "sums in random order" $ do
-        p <- createPool 8 :: IO (Pool (Sum Int))
-        _ <- async $ runPool p
+      it "sums in random order" $ withPool 8 $ \p -> do
         let go x = do
                 threadDelay (10000 * (x `mod` 3))
                 return $ Sum x
@@ -176,3 +176,15 @@ main = hspec $ do
                 Left e  -> mempty <$ print ("Hmmm... " ++ show e)
                 Right x -> return x
         getSum res `shouldBe` 210
+
+  describe "applicative style" $ do
+      it "counts to ten in one second" $ withPool 8 $ \p -> do
+          start <- getCurrentTime
+          x <- runTasks p $
+              let k a b c d e f g h = a + b + c + d + e + f + g + h
+                  h = task (threadDelay 1000000 >> return (1 :: Int))
+              in k <$> h <*> h <*> h <*> h <*> h <*> h <*> h <*> h
+          x `shouldBe` 8
+          end <- getCurrentTime
+          let diff = diffUTCTime end start
+          diff < 1.2 `shouldBe` True
