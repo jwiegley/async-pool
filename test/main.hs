@@ -4,7 +4,7 @@
 
 import           Control.Applicative
 import           Control.Concurrent
-import           Control.Concurrent.Async
+import qualified Control.Concurrent.Async as Async
 import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Monad
@@ -12,11 +12,12 @@ import           Data.Functor
 import           Data.Graph.Inductive.Graph as Gr
 import qualified Data.IntMap as M
 import           Data.Monoid
-import           Data.TaskPool.Internal
+import           Control.Concurrent.Async.Pool.Async
+import           Control.Concurrent.Async.Pool.Internal
 import           Data.Time
 import           Test.Hspec
 
-instance Show (TaskVar a) where
+instance Show (TMVar State) where
     show _ = "Task"
 
 testAvail p x = do
@@ -24,21 +25,21 @@ testAvail p x = do
     a `shouldBe` x
 
 testGraph p f x = do
-    g <- atomically $ readTVar (tasks p)
+    g <- atomically $ readTVar (tasks (pool p))
     (f g `shouldBe` x) `onException` prettyPrint g
 
 graphPict p x = do
-    g <- atomically $ readTVar (tasks p)
+    g <- atomically $ readTVar (tasks (pool p))
     prettify g `shouldBe` x
 
 testProcs p f x = do
     ps <- atomically $ do
-        g <- readTVar (tasks p)
+        g <- readTVar (tasks (pool p))
         foldM (go g) M.empty (nodes g)
     (f ps `shouldBe` x) `onException` print (M.keys ps)
   where
     go g acc h' = do
-        mres <- getTaskAsync g h'
+        mres <- getThreadId g h'
         return $ case mres of
             Nothing -> acc
             Just x  -> M.insert h' x acc
@@ -47,7 +48,8 @@ main :: IO ()
 main = hspec $ do
   describe "simple tasks" $ do
     it "completes a task" $ do
-        p <- createPool 8
+        p' <- createPool
+        p  <- createTaskGroup p' 8
 
         -- Upon creation of the pool, both the task graph and the process map
         -- are empty.
@@ -57,65 +59,61 @@ main = hspec $ do
 
         -- We submit a task, so that the graph has an entry, but the process
         -- map is still empty.
-        h <- atomically $ submitTask p $ return (42 :: Int)
+        h <- async p $ return (42 :: Int)
         testGraph p isEmpty False
         testProcs p M.null True
 
         -- Start running the pool in another thread and wait 100ms.  This is
         -- time enough for the task to finish.
-        a <- async (runPool p)
-        threadDelay 100000
+        Async.withAsync (runTaskGroup p) $ \_ -> do
+            threadDelay 100000
 
-        -- Now the task graph should be empty, but the process map should have
-        -- our completed Async in it, awaiting us to obtain the result.
-        testAvail p 8
-        testProcs p M.null False
+            -- Now the task graph should be empty.
+            testAvail p 8
+            testProcs p M.null True
 
-        -- Wait on the task and see the result value from the task.
-        res <- atomically $ waitTask p h
-        res `shouldBe` 42
+            -- Wait on the task and see the result value from the task.
+            res <- wait h
+            res `shouldBe` 42
 
-        -- Now the task graph should be empty, since observing the final state
-        -- removed the process entry from the map.
-        testGraph p isEmpty True
-        testProcs p M.null True
-
-        -- Cancel the thread that was running the pool.
-        cancel a
+            -- Now the task graph should be empty, since observing the final
+            -- state removed the process entry from the map.
+            testGraph p isEmpty True
+            testProcs p M.null True
 
     it "completes two concurrent tasks" $ do
-        p <- createPool 8
+        p' <- createPool
+        p  <- createTaskGroup p' 8
 
         testAvail p 8
         testGraph p isEmpty True
         testProcs p M.null True
 
-        h1 <- atomically $ submitTask p $ return (42 :: Int)
-        h2 <- atomically $ submitTask p $ return 43
+        h1 <- async p $ return (42 :: Int)
+        h2 <- async p $ return 43
 
         testGraph p isEmpty False
         testProcs p M.null True
 
         graphPict p "0:Task->[]\n1:Task->[]\n"
 
-        a <- async (runPool p)
-        threadDelay 100000
+        Async.withAsync (runTaskGroup p) $ \_ -> do
+            threadDelay 100000
 
-        testAvail p 8
-        testProcs p M.size 2
+            testAvail p 8
+            testProcs p M.null True
 
-        res <- atomically $ waitTask p h1
-        res `shouldBe` 42
-        res' <- atomically $ waitTask p h2
-        res' `shouldBe` 43
+            res <- wait h1
+            res `shouldBe` 42
+            res' <- wait h2
+            res' `shouldBe` 43
 
-        testGraph p isEmpty True
-        testProcs p M.null True
-
-        cancel a
+            testGraph p isEmpty True
+            testProcs p M.null True
 
     it "completes two linked tasks" $ do
-        p <- createPool 8
+        p' <- createPool
+        p  <- createTaskGroup p' 8
 
         testAvail p 8
         testGraph p isEmpty True
@@ -126,11 +124,11 @@ main = hspec $ do
         -- immediately reads the value from the TVar and adds to it.
         -- Sequencing should cause these two to happen in series.
         x <- atomically $ newTVar (0 :: Int)
-        h1 <- atomically $ submitTask p $ do
+        h1 <- async p $ do
             threadDelay 50000
             atomically $ writeTVar x 42
             return 42
-        h2 <- atomically $ submitDependentTask p [h1] $ do
+        h2 <- asyncAfter p [taskHandle h1] $ do
             y <- atomically $ readTVar x
             return $ y + 100
 
@@ -139,35 +137,32 @@ main = hspec $ do
 
         graphPict p "0:Task->[(Pending,1)]\n1:Task->[]\n"
 
-        a <- async (runPool p)
-        threadDelay 250000
+        Async.withAsync (runTaskGroup p) $ \_ -> do
+            threadDelay 250000
 
-        testAvail p 8
-        testProcs p M.size 2
+            testAvail p 8
+            testProcs p M.null True
 
-        res <- atomically $ waitTask p h1
-        res `shouldBe` 42
-        res' <- atomically $ waitTask p h2
-        res' `shouldBe` 142
+            res <- wait h1
+            res `shouldBe` 42
+            res' <- wait h2
+            res' `shouldBe` 142
 
-        testGraph p isEmpty True
-        testProcs p M.null True
-
-        cancel a
+            testGraph p isEmpty True
+            testProcs p M.null True
 
   describe "map reduce" $ do
     it "sums a group of integers" $ do
-        p <- createPool 8 :: IO (Pool (Sum Int))
+        p' <- createPool
+        p  <- createTaskGroup p' 8
         h <- atomically $ mapReduce p $ map (return . Sum) [1..10]
-        g <- atomically $ readTVar (tasks p)
-        withAsync (runPool p) $ const $ do
-            eres <- atomically $ waitTaskEither p h
-            case eres of
-                Left e  -> throwIO e
-                Right x -> x `shouldBe` Sum 55
+        g <- atomically $ readTVar (tasks (pool p))
+        Async.withAsync (runTaskGroup p) $ const $ do
+            x <- wait h
+            x `shouldBe` Sum 55
 
   describe "scatter fold" $ do
-      it "sums in random order" $ withPool 8 $ \p -> do
+      it "sums in random order" $ withTaskGroup 8 $ \p -> do
         let go x = do
                 threadDelay (10000 * (x `mod` 3))
                 return $ Sum x
@@ -178,7 +173,7 @@ main = hspec $ do
         getSum res `shouldBe` 210
 
   describe "applicative style" $ do
-      it "maps tasks" $ withPool 8 $ \p -> do
+      it "maps tasks" $ withTaskGroup 8 $ \p -> do
           start <- getCurrentTime
           x <- mapTasks p (replicate 8 (threadDelay 1000000 >> return (1 :: Int)))
           sum x `shouldBe` 8
@@ -186,7 +181,7 @@ main = hspec $ do
           let diff = diffUTCTime end start
           diff < 1.2 `shouldBe` True
 
-      it "counts to ten in one second" $ withPool 8 $ \p -> do
+      it "counts to ten in one second" $ withTaskGroup 8 $ \p -> do
           start <- getCurrentTime
           x <- runTask p $
               let k a b c d e f g h = a + b + c + d + e + f + g + h

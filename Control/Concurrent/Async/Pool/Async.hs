@@ -82,51 +82,73 @@
 
 -----------------------------------------------------------------------------
 
-module Control.Concurrent.Async (
-
-    -- * Asynchronous actions
-    Async,
-    -- ** Spawning
-    async, asyncBound, asyncOn, asyncWithUnmask, asyncOnWithUnmask,
-
-    -- ** Spawning with automatic 'cancel'ation
-    withAsync, withAsyncBound, withAsyncOn, withAsyncWithUnmask, withAsyncOnWithUnmask,
-
-    -- ** Quering 'Async's
-    wait, poll, waitCatch, cancel, cancelWith,
-    asyncThreadId,
-
-    -- ** STM operations
-    waitSTM, pollSTM, waitCatchSTM,
-
-    -- ** Waiting for multiple 'Async's
-    waitAny, waitAnyCatch, waitAnyCancel, waitAnyCatchCancel,
-    waitEither, waitEitherCatch, waitEitherCancel, waitEitherCatchCancel,
-    waitEither_,
-    waitBoth,
-
-    -- ** Linking
-    link, link2,
-
-    -- * Convenient utilities
-    race, race_, concurrently, mapConcurrently,
-    Concurrently(..),
-
-  ) where
+module Control.Concurrent.Async.Pool.Async
+    ( module Control.Concurrent.Async.Pool.Async
+    , module Gr
+    ) where
 
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Concurrent
-#if !MIN_VERSION_base(4,6,0)
-import Prelude hiding (catch)
-#endif
-import Control.Monad
 import Control.Applicative
+import Control.Monad hiding (forM, forM_, mapM, mapM_)
+import Data.Foldable
+import Data.Graph.Inductive.Graph as Gr hiding ((&))
+import Data.Graph.Inductive.PatriciaTree as Gr
+import Data.Graph.Inductive.Query.BFS as Gr
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
+import Data.Maybe (catMaybes)
 import Data.Traversable
+import Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
 
 import GHC.Exts
 import GHC.IO hiding (finally, onException)
 import GHC.Conc
+
+-- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
+type Handle    = Node
+data State     = Starting | Started ThreadId deriving (Eq, Show)
+data Status    = Pending | Completed deriving (Eq, Show)
+type TaskGraph = Gr (TMVar State) Status
+
+-- | A 'Pool' manages a collection of possibly interdependent tasks, such that
+--   tasks await execution until the tasks they depend on have finished (and
+--   tasks may depend on an arbitrary number of other tasks), while
+--   independent tasks execute concurrently up to the number of available
+--   resource slots in the pool.
+--
+--   Results from each task are available until the status of the task is
+--   polled or waited on.  Further, the results are kept until that occurs, so
+--   failing to ever wait will result in a memory leak.
+--
+--   Tasks may be cancelled, in which case all dependent tasks are
+--   unscheduled.
+data Pool = Pool
+    { tasks :: TVar TaskGraph
+      -- ^ The task graph represents a partially ordered set P with subset S
+      --   such that for every x ∈ S and y ∈ P, either x ≤ y or x is unrelated
+      --   to y.  Stated more simply, S is the set of least elements of all
+      --   maximal chains in P.  In our case, ≤ relates two uncompleted tasks
+      --   by dependency.  Therefore, S is equal to the set of tasks which may
+      --   execute concurrently, as none of them have incomplete dependencies.
+      --
+      --   We use a graph representation to make determination of S more
+      --   efficient (where S is just the set of roots in P expressed as a
+      --   graph).  Completion status is recorded on the edges, and nodes are
+      --   removed from the graph once no other incomplete node depends on
+      --   them.
+    , tokens :: TVar Int
+      -- ^ Tokens identify tasks, and are provisioned monotonically.
+    }
+
+data TaskGroup = TaskGroup
+    { pool :: Pool
+    , avail :: TVar Int
+      -- ^ The number of available execution slots in the pool.
+    , pending :: TVar (IntMap (IO ThreadId))
+      -- ^ Nodes in the task graph that are waiting to start.
+    }
 
 -- -----------------------------------------------------------------------------
 -- STM Async API
@@ -137,51 +159,101 @@ import GHC.Conc
 -- operations are provided for waiting for asynchronous actions to
 -- complete and obtaining their results (see e.g. 'wait').
 --
-data Async a = Async { asyncThreadId :: {-# UNPACK #-} !ThreadId
-                       -- ^ Returns the 'ThreadId' of the thread running the given 'Async'.
-                     , _asyncWait    :: STM (Either SomeException a) }
+data Async a = Async
+    { taskGroup  :: TaskGroup
+    , taskHandle :: {-# UNPACK #-} !Handle
+    , _asyncWait :: STM (Either SomeException a)
+    }
+
+getTaskVar :: TaskGraph -> Handle -> TMVar State
+getTaskVar g h = let (_to, _, t, _from) = context g h in t
+
+getThreadId :: TaskGraph -> Node -> STM (Maybe ThreadId)
+getThreadId g h = do
+    status <- tryReadTMVar (getTaskVar g h)
+    return $ case status of
+        Just (Started x) -> Just x
+        _ -> Nothing
 
 instance Eq (Async a) where
-  Async a _ == Async b _  =  a == b
+  Async _ a _ == Async _ b _  =  a == b
 
 instance Ord (Async a) where
-  Async a _ `compare` Async b _  =  a `compare` b
+  Async _ a _ `compare` Async _ b _  =  a `compare` b
 
 instance Functor Async where
-  fmap f (Async a w) = Async a (fmap (fmap f) w)
+  fmap f (Async p a w) = Async p a (fmap (fmap f) w)
 
 
 -- | Spawn an asynchronous action in a separate thread.
-async :: IO a -> IO (Async a)
-async = inline asyncUsing rawForkIO
+async :: TaskGroup -> IO a -> IO (Async a)
+async p = atomically . inline asyncUsing p rawForkIO
 
 -- | Like 'async' but using 'forkOS' internally.
-asyncBound :: IO a -> IO (Async a)
-asyncBound = asyncUsing forkOS
+asyncBound :: TaskGroup -> IO a -> IO (Async a)
+asyncBound p = atomically . asyncUsing p forkOS
 
 -- | Like 'async' but using 'forkOn' internally.
-asyncOn :: Int -> IO a -> IO (Async a)
-asyncOn = asyncUsing . rawForkOn
+asyncOn :: TaskGroup -> Int -> IO a -> IO (Async a)
+asyncOn p = (atomically .) . asyncUsing p . rawForkOn
 
 -- | Like 'async' but using 'forkIOWithUnmask' internally.
 -- The child thread is passed a function that can be used to unmask asynchronous exceptions.
-asyncWithUnmask :: ((forall b . IO b -> IO b) -> IO a) -> IO (Async a)
-asyncWithUnmask actionWith = asyncUsing rawForkIO (actionWith unsafeUnmask)
+asyncWithUnmask :: TaskGroup -> ((forall b . IO b -> IO b) -> IO a) -> IO (Async a)
+asyncWithUnmask p actionWith =
+    atomically $ asyncUsing p rawForkIO (actionWith unsafeUnmask)
 
 -- | Like 'asyncOn' but using 'forkOnWithUnmask' internally.
 -- The child thread is passed a function that can be used to unmask asynchronous exceptions.
-asyncOnWithUnmask :: Int -> ((forall b . IO b -> IO b) -> IO a) -> IO (Async a)
-asyncOnWithUnmask cpu actionWith = asyncUsing (rawForkOn cpu) (actionWith unsafeUnmask)
+asyncOnWithUnmask :: TaskGroup -> Int -> ((forall b . IO b -> IO b) -> IO a) -> IO (Async a)
+asyncOnWithUnmask p cpu actionWith =
+    atomically $ asyncUsing p (rawForkOn cpu) (actionWith unsafeUnmask)
 
-asyncUsing :: (IO () -> IO ThreadId)
-           -> IO a -> IO (Async a)
-asyncUsing doFork = \action -> do
-   var <- newEmptyTMVarIO
-   -- t <- forkFinally action (\r -> atomically $ putTMVar var r)
-   -- slightly faster:
-   t <- mask $ \restore ->
-          doFork $ try (restore action) >>= atomically . putTMVar var
-   return (Async t (readTMVar var))
+asyncUsing :: TaskGroup -> (IO () -> IO ThreadId) -> IO a -> STM (Async a)
+asyncUsing p doFork action = do
+    h <- nextIdent (pool p)
+
+    var <- newEmptyTMVar
+    let start = mask $ \restore ->
+            doFork $ try (restore (action `finally` cleanup h))
+                >>= atomically . putTMVar var
+
+    modifyTVar (pending p) (IntMap.insert h start)
+    tv <- newEmptyTMVar
+    modifyTVar (tasks (pool p)) (insNode (h, tv))
+
+    return $ Async p h (readTMVar var)
+  where
+    cleanup h = atomically $ do
+        modifyTVar (avail p) succ
+        cleanupTask (pool p) h
+
+-- | Return the next available thread identifier from the pool.  These are
+--   monotonically increasing integers.
+nextIdent :: Pool -> STM Int
+nextIdent p = do
+    tok <- readTVar (tokens p)
+    writeTVar (tokens p) (succ tok)
+    return tok
+
+cleanupTask :: Pool -> Handle -> STM ()
+cleanupTask p h =
+    -- Once the task is done executing, we must alter the graph so any
+    -- dependent children will know their parent has completed.
+    modifyTVar (tasks p) $ \g ->
+        case zip (repeat h) (Gr.suc g h) of
+            -- If nothing dependend on this task and if the final result value
+            -- has been observed, prune it from the graph, as well as any
+            -- parents which now have no dependents.  Otherwise mark the edges
+            -- as Completed so dependent children can execute.
+            [] -> dropTask h g
+            es -> insEdges (completeEdges es) $ delEdges es g
+  where
+    completeEdges = map (\(f, t) -> (f, t, Completed))
+
+    dropTask k gr = foldl' f (delNode k gr) (Gr.pre gr k)
+      where
+        f g n = if outdeg g n == 0 then dropTask n g else g
 
 -- | Spawn an asynchronous action in a separate thread, and pass its
 -- @Async@ handle to the supplied function.  When the function returns
@@ -195,36 +267,35 @@ asyncUsing doFork = \action -> do
 -- Since 'cancel' may block, 'withAsync' may also block; see 'cancel'
 -- for details.
 --
-withAsync :: IO a -> (Async a -> IO b) -> IO b
-withAsync = inline withAsyncUsing rawForkIO
+withAsync :: TaskGroup -> IO a -> (Async a -> IO b) -> IO b
+withAsync p = inline withAsyncUsing p rawForkIO
 
 -- | Like 'withAsync' but uses 'forkOS' internally.
-withAsyncBound :: IO a -> (Async a -> IO b) -> IO b
-withAsyncBound = withAsyncUsing forkOS
+withAsyncBound :: TaskGroup -> IO a -> (Async a -> IO b) -> IO b
+withAsyncBound p = withAsyncUsing p forkOS
 
 -- | Like 'withAsync' but uses 'forkOn' internally.
-withAsyncOn :: Int -> IO a -> (Async a -> IO b) -> IO b
-withAsyncOn = withAsyncUsing . rawForkOn
+withAsyncOn :: TaskGroup -> Int -> IO a -> (Async a -> IO b) -> IO b
+withAsyncOn p = withAsyncUsing p . rawForkOn
 
 -- | Like 'withAsync' but uses 'forkIOWithUnmask' internally.
 -- The child thread is passed a function that can be used to unmask asynchronous exceptions.
-withAsyncWithUnmask :: ((forall c. IO c -> IO c) -> IO a) -> (Async a -> IO b) -> IO b
-withAsyncWithUnmask actionWith = withAsyncUsing rawForkIO (actionWith unsafeUnmask)
+withAsyncWithUnmask :: TaskGroup -> ((forall c. IO c -> IO c) -> IO a) -> (Async a -> IO b) -> IO b
+withAsyncWithUnmask p actionWith =
+    withAsyncUsing p rawForkIO (actionWith unsafeUnmask)
 
 -- | Like 'withAsyncOn' but uses 'forkOnWithUnmask' internally.
 -- The child thread is passed a function that can be used to unmask asynchronous exceptions
-withAsyncOnWithUnmask :: Int -> ((forall c. IO c -> IO c) -> IO a) -> (Async a -> IO b) -> IO b
-withAsyncOnWithUnmask cpu actionWith = withAsyncUsing (rawForkOn cpu) (actionWith unsafeUnmask)
+withAsyncOnWithUnmask :: TaskGroup -> Int -> ((forall c. IO c -> IO c) -> IO a) -> (Async a -> IO b) -> IO b
+withAsyncOnWithUnmask p cpu actionWith = withAsyncUsing p (rawForkOn cpu) (actionWith unsafeUnmask)
 
-withAsyncUsing :: (IO () -> IO ThreadId)
-               -> IO a -> (Async a -> IO b) -> IO b
+withAsyncUsing :: TaskGroup -> (IO () -> IO ThreadId) -> IO a -> (Async a -> IO b)
+               -> IO b
 -- The bracket version works, but is slow.  We can do better by
 -- hand-coding it:
-withAsyncUsing doFork = \action inner -> do
-  var <- newEmptyTMVarIO
+withAsyncUsing p doFork = \action inner -> do
   mask $ \restore -> do
-    t <- doFork $ try (restore action) >>= atomically . putTMVar var
-    let a = Async t (readTMVar var)
+    a <- atomically $ asyncUsing p doFork $ restore action
     r <- restore (inner a) `catchAll` \e -> do cancel a; throwIO e
     cancel a
     return r
@@ -271,13 +342,13 @@ waitSTM a = do
 --
 {-# INLINE waitCatchSTM #-}
 waitCatchSTM :: Async a -> STM (Either SomeException a)
-waitCatchSTM (Async _ w) = w
+waitCatchSTM (Async _ _ w) = w
 
 -- | A version of 'poll' that can be used inside an STM transaction.
 --
 {-# INLINE pollSTM #-}
 pollSTM :: Async a -> STM (Maybe (Either SomeException a))
-pollSTM (Async _ w) = (Just <$> w) `orElse` return Nothing
+pollSTM (Async _ _ w) = (Just <$> w) `orElse` return Nothing
 
 -- | Cancel an asynchronous action by throwing the @ThreadKilled@
 -- exception to it.  Has no effect if the 'Async' has already
@@ -295,7 +366,7 @@ pollSTM (Async _ w) = (Just <$> w) `orElse` return Nothing
 --
 {-# INLINE cancel #-}
 cancel :: Async a -> IO ()
-cancel (Async t _) = throwTo t ThreadKilled
+cancel = flip cancelWith ThreadKilled
 
 -- | Cancel an asynchronous action by throwing the supplied exception
 -- to it.
@@ -305,7 +376,43 @@ cancel (Async t _) = throwTo t ThreadKilled
 -- The notes about the synchronous nature of 'cancel' also apply to
 -- 'cancelWith'.
 cancelWith :: Exception e => Async a -> e -> IO ()
-cancelWith (Async t _) e = throwTo t e
+cancelWith (Async p h _) e =
+    (mapM_ (`throwTo` e) =<<) $ atomically $ do
+        g <- readTVar (tasks (pool p))
+        let hs = if gelem h g then nodeList g h else []
+        xs <- foldM (go g) [] hs
+        writeTVar (tasks (pool p)) $ foldl' (flip delNode) g hs
+        return xs
+  where
+    go g acc h' = do
+        status <- readTMVar (getTaskVar g h')
+        case status of
+            Starting  -> retry
+            Started x -> return $ x:acc
+
+    nodeList :: TaskGraph -> Node -> [Node]
+    nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
+
+-- | Cancel an asynchronous action by throwing the @ThreadKilled@ exception to
+--   it, or unregistering it from the task pool if it had not started yet.  Has
+--   no effect if the 'Async' has already completed.
+--
+-- Note that 'cancel' is synchronous in the same sense as 'throwTo'.  It does
+-- not return until the exception has been thrown in the target thread, or the
+-- target thread has completed.  In particular, if the target thread is making
+-- a foreign call, the exception will not be thrown until the foreign call
+-- returns, and in this case 'cancel' may block indefinitely.  An asynchronous
+-- 'cancel' can of course be obtained by wrapping 'cancel' itself in 'async'.
+cancelAll :: TaskGroup -> IO ()
+cancelAll p = (mapM_ (`throwTo` ThreadKilled) =<<) $ atomically $ do
+    writeTVar (pending p) IntMap.empty
+    g  <- readTVar (tasks (pool p))
+    -- jww (2014-09-02): There is a race here between when a task is forked,
+    -- and when its ThreadId is updated in the TaskGraph (and that update
+    -- isn't even happening in asyncUsing right now).
+    xs <- catMaybes <$> mapM (getThreadId g) (nodes g)
+    writeTVar (tasks (pool p)) Gr.empty
+    return xs
 
 -- | Wait for any of the supplied asynchronous operations to complete.
 -- The value returned is a pair of the 'Async' that completed, and the
@@ -412,7 +519,7 @@ waitBoth left right =
 -- the current thread.
 --
 link :: Async a -> IO ()
-link (Async _ w) = do
+link (Async _ _ w) = do
   me <- myThreadId
   void $ forkRepeat $ do
      r <- atomically $ w
@@ -424,12 +531,12 @@ link (Async _ w) = do
 -- exception, the same exception is re-thrown in the other @Async@.
 --
 link2 :: Async a -> Async b -> IO ()
-link2 left@(Async tl _)  right@(Async tr _) =
+link2 left right =
   void $ forkRepeat $ do
     r <- waitEitherCatch left right
     case r of
-      Left  (Left e) -> throwTo tr e
-      Right (Left e) -> throwTo tl e
+      Left  (Left e) -> cancelWith right e
+      Right (Left e) -> cancelWith left e
       _ -> return ()
 
 
@@ -443,11 +550,11 @@ link2 left@(Async tl _)  right@(Async tr _) =
 -- >   withAsync right $ \b ->
 -- >   waitEither a b
 --
-race :: IO a -> IO b -> IO (Either a b)
+race :: TaskGroup -> IO a -> IO b -> IO (Either a b)
 
 -- | Like 'race', but the result is ignored.
 --
-race_ :: IO a -> IO b -> IO ()
+race_ :: TaskGroup -> IO a -> IO b -> IO ()
 
 -- | Run two @IO@ actions concurrently, and return both results.  If
 -- either action throws an exception at any time, then the other
@@ -458,25 +565,25 @@ race_ :: IO a -> IO b -> IO ()
 -- >   withAsync left $ \a ->
 -- >   withAsync right $ \b ->
 -- >   waitBoth a b
-concurrently :: IO a -> IO b -> IO (a,b)
+concurrently :: TaskGroup -> IO a -> IO b -> IO (a,b)
 
-#define USE_ASYNC_VERSIONS 0
+#define USE_ASYNC_VERSIONS 1
 
 #if USE_ASYNC_VERSIONS
 
-race left right =
-  withAsync left $ \a ->
-  withAsync right $ \b ->
+race p left right =
+  withAsync p left $ \a ->
+  withAsync p right $ \b ->
   waitEither a b
 
-race_ left right =
-  withAsync left $ \a ->
-  withAsync right $ \b ->
+race_ p left right =
+  withAsync p left $ \a ->
+  withAsync p right $ \b ->
   waitEither_ a b
 
-concurrently left right =
-  withAsync left $ \a ->
-  withAsync right $ \b ->
+concurrently p left right =
+  withAsync p left $ \a ->
+  withAsync p right $ \b ->
   waitBoth a b
 
 #else
@@ -533,8 +640,8 @@ concurrently' left right collect = do
 --
 -- > pages <- mapConcurrently getURL ["url1", "url2", "url3"]
 --
-mapConcurrently :: Traversable t => (a -> IO b) -> t a -> IO (t b)
-mapConcurrently f = runConcurrently . traverse (Concurrently . f)
+mapConcurrently :: Traversable t => TaskGroup -> (a -> IO b) -> t a -> IO (t b)
+mapConcurrently tg f = flip runConcurrently tg . traverse (\a -> Concurrently $ \_ -> f a)
 
 -- -----------------------------------------------------------------------------
 
@@ -554,20 +661,20 @@ mapConcurrently f = runConcurrently . traverse (Concurrently . f)
 -- >     <*> Concurrently (getURL "url2")
 -- >     <*> Concurrently (getURL "url3")
 --
-newtype Concurrently a = Concurrently { runConcurrently :: IO a }
+newtype Concurrently a = Concurrently { runConcurrently :: TaskGroup -> IO a }
 
 instance Functor Concurrently where
-  fmap f (Concurrently a) = Concurrently $ f <$> a
+  fmap f (Concurrently a) = Concurrently $ fmap f <$> a
 
 instance Applicative Concurrently where
-  pure = Concurrently . return
+  pure x = Concurrently $ \_ -> return x
   Concurrently fs <*> Concurrently as =
-    Concurrently $ (\(f, a) -> f a) <$> concurrently fs as
+    Concurrently $ \tg -> (\(f, a) -> f a) <$> concurrently tg (fs tg) (as tg)
 
 instance Alternative Concurrently where
-  empty = Concurrently $ forever (threadDelay maxBound)
+  empty = Concurrently $ \_ -> forever (threadDelay maxBound)
   Concurrently as <|> Concurrently bs =
-    Concurrently $ either id id <$> race as bs
+    Concurrently $ \tg -> either id id <$> race tg (as tg) (bs tg)
 
 -- ----------------------------------------------------------------------------
 

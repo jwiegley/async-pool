@@ -1,6 +1,6 @@
-Name:           taskpool
+Name:           async-pool
 Version:        0.1.0
-Synopsis:       Manage pools of possibly interdependent tasks using STM and async
+Synopsis:       A variation of async supporting interdependent task pools
 License-file:   LICENSE
 License:        MIT
 Author:         John Wiegley
@@ -9,12 +9,12 @@ Build-Type:     Simple
 Cabal-Version:  >=1.10
 Category:       System
 Description:
-  A taskpool is a network of tasks (where connection indicates dependency),
+  A task Pool is a network of tasks (where connection indicates dependency),
   where up to N independent tasks at time may execute concurrently.
 
 Source-repository head
   type: git
-  location: git://github.com/jwiegley/taskpool.git
+  location: git://github.com/jwiegley/async-pool.git
 
 Library
     default-language: Haskell98
@@ -27,8 +27,10 @@ Library
       , containers
       , transformers
     exposed-modules:
-        Data.TaskPool
-        Data.TaskPool.Internal
+        Control.Concurrent.Async.Pool
+    other-modules:
+        Control.Concurrent.Async.Pool.Async
+        Control.Concurrent.Async.Pool.Internal
 
 test-suite test
     hs-source-dirs: . test
@@ -37,7 +39,8 @@ test-suite test
     type: exitcode-stdio-1.0
     ghc-options: -threaded -with-rtsopts "-N2"
     other-modules:
-        Data.TaskPool.Internal
+        Control.Concurrent.Async.Pool.Async
+        Control.Concurrent.Async.Pool.Internal
     build-depends:
         base
       , async

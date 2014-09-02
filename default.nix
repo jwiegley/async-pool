@@ -3,8 +3,8 @@
 { cabal, async, fgl, hspec, stm, time, transformers }:
 
 cabal.mkDerivation (self: {
-  pname = "taskpool";
-  version = "0.0.4";
+  pname = "async-pool";
+  version = "0.1.0";
   src = builtins.filterSource (path: type: type != "unknown") ./.;
   buildDepends = [ async fgl stm transformers ];
   testDepends = [ async fgl hspec stm time transformers ];
