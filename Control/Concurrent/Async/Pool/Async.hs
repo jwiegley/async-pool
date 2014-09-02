@@ -98,7 +98,6 @@ import Data.Graph.Inductive.PatriciaTree as Gr
 import Data.Graph.Inductive.Query.BFS as Gr
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import Data.Maybe (catMaybes)
 import Data.Traversable
 import Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
 
@@ -108,9 +107,9 @@ import GHC.Conc
 
 -- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
-data State     = Starting | Started ThreadId deriving (Eq, Show)
+data State     = Ready | Starting | Started ThreadId deriving (Eq, Show)
 data Status    = Pending | Completed deriving (Eq, Show)
-type TaskGraph = Gr (TMVar State) Status
+type TaskGraph = Gr (TVar State) Status
 
 -- | A 'Pool' manages a collection of possibly interdependent tasks, such that
 --   tasks await execution until the tasks they depend on have finished (and
@@ -165,15 +164,16 @@ data Async a = Async
     , _asyncWait :: STM (Either SomeException a)
     }
 
-getTaskVar :: TaskGraph -> Handle -> TMVar State
+getTaskVar :: TaskGraph -> Handle -> TVar State
 getTaskVar g h = let (_to, _, t, _from) = context g h in t
 
 getThreadId :: TaskGraph -> Node -> STM (Maybe ThreadId)
 getThreadId g h = do
-    status <- tryReadTMVar (getTaskVar g h)
-    return $ case status of
-        Just (Started x) -> Just x
-        _ -> Nothing
+    status <- readTVar (getTaskVar g h)
+    case status of
+        Ready     -> return Nothing
+        Starting  -> retry
+        Started x -> return $ Just x
 
 instance Eq (Async a) where
   Async _ a _ == Async _ b _  =  a == b
@@ -219,7 +219,7 @@ asyncUsing p doFork action = do
                 >>= atomically . putTMVar var
 
     modifyTVar (pending p) (IntMap.insert h start)
-    tv <- newEmptyTMVar
+    tv <- newTVar Ready
     modifyTVar (tasks (pool p)) (insNode (h, tv))
 
     return $ Async p h (readTMVar var)
@@ -375,23 +375,22 @@ cancel = flip cancelWith ThreadKilled
 --
 -- The notes about the synchronous nature of 'cancel' also apply to
 -- 'cancelWith'.
-cancelWith :: Exception e => Async a -> e -> IO ()
-cancelWith (Async p h _) e =
+cancelWith' :: Exception e => Pool -> Handle -> e -> IO ()
+cancelWith' p h e =
     (mapM_ (`throwTo` e) =<<) $ atomically $ do
-        g <- readTVar (tasks (pool p))
+        g <- readTVar (tasks p)
         let hs = if gelem h g then nodeList g h else []
         xs <- foldM (go g) [] hs
-        writeTVar (tasks (pool p)) $ foldl' (flip delNode) g hs
+        writeTVar (tasks p) $ foldl' (flip delNode) g hs
         return xs
   where
-    go g acc h' = do
-        status <- readTMVar (getTaskVar g h')
-        case status of
-            Starting  -> retry
-            Started x -> return $ x:acc
+    go g acc h' = maybe acc (:acc) <$> getThreadId g h'
 
     nodeList :: TaskGraph -> Node -> [Node]
     nodeList g k = k : concatMap (nodeList g) (Gr.suc g k)
+
+cancelWith :: Exception e => Async a -> e -> IO ()
+cancelWith (Async p h _) = cancelWith' (pool p) h
 
 -- | Cancel an asynchronous action by throwing the @ThreadKilled@ exception to
 --   it, or unregistering it from the task pool if it had not started yet.  Has
@@ -404,15 +403,12 @@ cancelWith (Async p h _) e =
 -- returns, and in this case 'cancel' may block indefinitely.  An asynchronous
 -- 'cancel' can of course be obtained by wrapping 'cancel' itself in 'async'.
 cancelAll :: TaskGroup -> IO ()
-cancelAll p = (mapM_ (`throwTo` ThreadKilled) =<<) $ atomically $ do
-    writeTVar (pending p) IntMap.empty
-    g  <- readTVar (tasks (pool p))
-    -- jww (2014-09-02): There is a race here between when a task is forked,
-    -- and when its ThreadId is updated in the TaskGraph (and that update
-    -- isn't even happening in asyncUsing right now).
-    xs <- catMaybes <$> mapM (getThreadId g) (nodes g)
-    writeTVar (tasks (pool p)) Gr.empty
-    return xs
+cancelAll p = do
+    hs <- atomically $ do
+        writeTVar (pending p) IntMap.empty
+        g <- readTVar (tasks (pool p))
+        return $ nodes g
+    mapM_ (\h -> cancelWith' (pool p) h ThreadKilled) hs
 
 -- | Wait for any of the supplied asynchronous operations to complete.
 -- The value returned is a pair of the 'Async' that completed, and the

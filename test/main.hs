@@ -17,7 +17,7 @@ import           Control.Concurrent.Async.Pool.Internal
 import           Data.Time
 import           Test.Hspec
 
-instance Show (TMVar State) where
+instance Show (TVar State) where
     show _ = "Task"
 
 testAvail p x = do

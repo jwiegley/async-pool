@@ -50,7 +50,7 @@ getReadyNodes p g = do
 
 -- | Return information about the list of tasks ready to execute, sufficient
 --   to start them and remove them from the graph afterwards.
-getReadyTasks :: TaskGroup -> STM [(TMVar State, IO ThreadId)]
+getReadyTasks :: TaskGroup -> STM [(TVar State, IO ThreadId)]
 getReadyTasks p = do
     g <- readTVar (tasks (pool p))
     map (first (getTaskVar g)) . IntMap.toList <$> getReadyNodes p g
@@ -66,12 +66,12 @@ runTaskGroup p = forever $ do
         check (cnt > 0)
         ready <- getReadyTasks p
         check (not (null ready))
-        forM_ ready $ \(tv, _) -> putTMVar tv Starting
+        forM_ ready $ \(tv, _) -> writeTVar tv Starting
         return ready
 
     forM_ ready $ \(tv, go) -> do
         t <- go
-        atomically $ swapTMVar tv $ Started t
+        atomically $ swapTVar tv $ Started t
 
 -- | Create a task pool for managing many-to-many acyclic dependencies among
 --   tasks.
