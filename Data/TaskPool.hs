@@ -21,16 +21,16 @@ module Data.TaskPool
     , pollTaskEither
 
     , mapTasks
-    , mapTasksE
-    , mapTasks_
-    , mapTasksE_
+    -- , mapTasksE
+    -- , mapTasks_
+    -- , mapTasksE_
     , mapTasksRace
 
     , mapReduce
     , scatterFoldM
 
-    , Tasks
-    , runTasks
+    , Task
+    , runTask
     , task
     ) where
 

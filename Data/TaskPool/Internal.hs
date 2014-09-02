@@ -24,17 +24,18 @@ import           Data.Traversable
 import           Data.Typeable
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap,
                                  foldl1)
+import           Unsafe.Coerce (unsafeCoerce)
 
 -- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
-type TaskVar a = TVar (Task a)
+type TaskVar a = TVar (State a)
 
-data Task a = Ready
+data State a = Ready
             | Starting
             | Started (Async a)
             | Observed
 
-instance Show (Task a) where
+instance Show (State a) where
     show Ready       = "Ready"
     show Starting    = "Starting"
     show (Started _) = "Started"
@@ -93,20 +94,23 @@ data Pool a = Pool
 getReadyNodes :: Pool a -> TaskGraph a -> STM (IntMap (IO a))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
+    check (availSlots > 0)
     taskQueue  <- readTVar (pending p)
+    check (not (IntMap.null taskQueue))
     let readyNodes = IntMap.fromList $ take availSlots $ IntMap.toAscList
                    $ IntMap.filterWithKey (const . isReady) taskQueue
+    check (not (IntMap.null readyNodes))
     writeTVar (avail p) (availSlots - IntMap.size readyNodes)
     writeTVar (pending p) (taskQueue IntMap.\\ readyNodes)
     return readyNodes
   where
-    -- | Returns True for every node for which there are no dependencies or
-    --   incomplete dependencies, and which is not itself a completed
-    --   dependency.  The reason for the latter condition is that we keep
-    --   completed nodes with dependents in graph until their dependents have
-    --   completed (recursively), so that the dependent knows only to begin
-    --   when its parent has truly finished -- a fact which cannot be
-    --   determined using only the process map.
+    -- Returns True for every node for which there are no dependencies or
+    -- incomplete dependencies, and which is not itself a completed dependency.
+    -- The reason for the latter condition is that we keep completed nodes
+    -- with dependents in graph until their dependents have completed
+    -- (recursively), so that the dependent knows only to begin when its
+    -- parent has truly finished -- a fact which cannot be determined using
+    -- only the process map.
     isReady x = all      isCompleted  (inn g x)
               && all (not . isCompleted) (out g x)
 
@@ -415,40 +419,55 @@ withPool n f = do
     p <- createPool n
     withAsync (runPool p) $ const $ f p
 
--- | Run a group of up to N tasks at a time concurrently, returning the
---   results in order.  The order of execution is random, but the results are
---   returned in order.
-mapTasks' :: Traversable t
-          => Int
-          -> t (IO a)
-          -> (IO (t b) -> IO (t c))
-          -> (Pool a -> Handle -> STM b)
-          -> IO (t c)
-mapTasks' n fs f g = withPool n $ \p -> do
+-- | Helper function used by several of the variants of 'mapTasks' below.
+mapTasksWorker :: Traversable t
+               => Pool a
+               -> t (IO a)
+               -> (IO (t b) -> IO (t c))
+               -> (Pool a -> Handle -> STM b)
+               -> IO (t c)
+mapTasksWorker p fs f g = do
     hs <- forM fs $ atomically . submitTask p
     f $ forM hs $ atomically . g p
 
 -- | Run a group of up to N tasks at a time concurrently, returning the
 --   results in order.  The order of execution is random, but the results are
---   returned in order.
-mapTasks :: Traversable t => Int -> t (IO a) -> IO (t a)
-mapTasks n fs = mapTasks' n fs id waitTask
+--   returned in order.  This version is more optimal than mapTasks in the
+--   case where the Pool type is the same as the result type of each action.
+mapTasks :: Traversable t => Pool a -> t (IO a) -> IO (t a)
+mapTasks p fs = mapTasksWorker p fs id waitTask
 
 -- | Run a group of up to N tasks at a time concurrently, returning the
 --   results in order.  The order of execution is random, but the results are
---   returned in order.
-mapTasksE :: Traversable t => Int -> t (IO a) -> IO (t (Either SomeException a))
-mapTasksE n fs = mapTasks' n fs id waitTaskEither
+--   returned in order.  This function does not care about the type the Pool is
+--   mapped over, and so can produce values of any type 'a' from any Pool.
+--   This comes at a cost of some overhead, however (an extra 'TMVar' per task
+--   to communicate the result).
+mapTasksAny :: Traversable t => Pool u -> t (IO a) -> IO (t a)
+mapTasksAny p = runTask p . sequenceA . fmap task
+
+-- -- | Run a group of up to N tasks at a time concurrently, returning the
+-- --   results in order.  The order of execution is random, but the results are
+-- --   returned in order.
+mapTasksE :: Traversable t => Pool a -> t (IO a) -> IO (t (Either SomeException a))
+mapTasksE p fs = mapTasksWorker p fs id waitTaskEither
 
 -- | Run a group of up to N tasks at a time concurrently, ignoring the
 --   results.
-mapTasks_ :: Foldable t => Int -> t (IO a) -> IO ()
-mapTasks_ n fs = withPool n $ \p -> forM_ fs $ atomically . submitTask_ p
+mapTasks_ :: Foldable t => Pool a -> t (IO a) -> IO ()
+mapTasks_ p fs = forM_ fs $ atomically . submitTask_ p
 
 -- | Run a group of up to N tasks at a time concurrently, ignoring the
---   results, but returning whether an exception occurred for each task.
-mapTasksE_ :: Traversable t => Int -> t (IO a) -> IO (t (Maybe SomeException))
-mapTasksE_ n fs = mapTasks' n fs (fmap (fmap leftToMaybe)) waitTaskEither
+--   results.  This version of the function does not care about the type the
+--   Pool is mapped over, and so can produce values of any type 'a' from any
+--   Pool.  This comes at the cost of some overhead, however.
+mapTasksAny_ :: Foldable t => Pool u -> t (IO ()) -> IO ()
+mapTasksAny_ p = runTask p . foldr ((*>) . task) (pure ())
+
+-- -- | Run a group of up to N tasks at a time concurrently, ignoring the
+-- --   results, but returning whether an exception occurred for each task.
+mapTasksE_ :: Traversable t => Pool a -> t (IO a) -> IO (t (Maybe SomeException))
+mapTasksE_ p fs = mapTasksWorker p fs (fmap (fmap leftToMaybe)) waitTaskEither
   where
     leftToMaybe :: Either a b -> Maybe a
     leftToMaybe = either Just (const Nothing)
@@ -561,36 +580,42 @@ scatterFoldM p fs f = do
 -- | The 'Tasks' Applicative and Monad allow for task dependencies to be built
 --   using applicative and do notation.  Monadic evaluation is sequenced,
 --   while applicative evaluation is done concurrently for each argument.
-newtype Tasks a = Tasks { runTasks' :: Pool () -> IO ([Handle], IO a) }
+newtype Task a = Task
+    { runTask' :: forall b. Pool b -> IO (IO a)
+    }
 
-runTasks :: Pool () -> Tasks a -> IO a
-runTasks pool ts = join $ snd <$> runTasks' ts pool
+runTask :: Pool b -> Task a -> IO a
+runTask pool ts = join $ runTask' ts pool
 
-task :: IO a -> Tasks a
-task action = Tasks $ \_ -> return ([], action)
+task :: IO a -> Task a
+task action = Task $ \_ -> return action
 
-instance Functor Tasks where
-    fmap f (Tasks k) = Tasks $ fmap (fmap (fmap (liftM f))) k
+instance Functor Task where
+    fmap f (Task k) = Task $ fmap (fmap (liftM f)) k
 
-instance Applicative Tasks where
-    pure x = Tasks $ \_ -> return ([], return x)
-    Tasks f <*> Tasks x = Tasks $ \pool -> do
-        (xh, xa) <- x pool
-        (tx, x') <- wrap pool xh xa
-        (fh, fa) <- f pool
-        return (tx:fh, fa >>= flip fmap x')
+instance Applicative Task where
+    pure x = Task $ \_ -> return (return x)
+    Task f <*> Task x = Task $ \pool -> do
+        xa <- x pool
+        x' <- wrap (unsafeCoerce pool) xa
+        fa <- f pool
+        return $ fa <*> x'
       where
-        wrap pool hs action = atomically $ do
+        wrap pool action = atomically $ do
             mv <- newEmptyTMVar
-            t <- submitTask_ pool $ atomically . putTMVar mv =<< action
-            forM_ hs $ unsafeSequenceTasks pool t
-            return (t, atomically $ takeTMVar mv)
+            _  <- submitTask_ pool $
+                catch (atomically . putTMVar mv . Right =<< action)
+                      (atomically . putTMVar mv . Left)
+            return $ do
+                eres <- atomically $ takeTMVar mv
+                case eres of
+                    Left e  -> throwIO (e :: SomeException)
+                    Right y -> return y
 
-instance Monad Tasks where
+instance Monad Task where
     return = pure
-    Tasks m >>= f = Tasks $ \pool -> do
-        (_mh, mx) <- m pool
-        mx >>= flip runTasks' pool . f
+    Task m >>= f = Task $ \pool ->
+        join (m pool) >>= flip runTask' pool . f
 
-instance MonadIO Tasks where
+instance MonadIO Task where
     liftIO = task

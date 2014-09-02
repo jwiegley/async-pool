@@ -178,9 +178,17 @@ main = hspec $ do
         getSum res `shouldBe` 210
 
   describe "applicative style" $ do
+      it "maps tasks" $ withPool 8 $ \p -> do
+          start <- getCurrentTime
+          x <- mapTasks p (replicate 8 (threadDelay 1000000 >> return (1 :: Int)))
+          sum x `shouldBe` 8
+          end <- getCurrentTime
+          let diff = diffUTCTime end start
+          diff < 1.2 `shouldBe` True
+
       it "counts to ten in one second" $ withPool 8 $ \p -> do
           start <- getCurrentTime
-          x <- runTasks p $
+          x <- runTask p $
               let k a b c d e f g h = a + b + c + d + e + f + g + h
                   h = task (threadDelay 1000000 >> return (1 :: Int))
               in k <$> h <*> h <*> h <*> h <*> h <*> h <*> h <*> h
