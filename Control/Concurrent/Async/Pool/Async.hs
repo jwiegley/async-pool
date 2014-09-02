@@ -142,8 +142,8 @@ data Pool = Pool
     }
 
 data TaskGroup = TaskGroup
-    { pool :: Pool
-    , avail :: TVar Int
+    { pool    :: Pool
+    , avail   :: TVar Int
       -- ^ The number of available execution slots in the pool.
     , pending :: TVar (IntMap (IO ThreadId))
       -- ^ Nodes in the task graph that are waiting to start.

@@ -120,21 +120,24 @@ makeDependent p child parent = do
 
         _ -> error "sequenceTasks: Attempt to introduce cycle in task graph"
 
--- | Submit a task, but only allow it begin executing once its parent task has
---   completed.  This is equivalent to submitting a new task and linking it to
---   its parent using 'sequenceTasks' within a single STM transaction.
+-- | Submit a task, but only begin executing it once its parent has completed.
+--   This is equivalent to submitting a new task and linking it to its parent
+--   using 'makeDependent' within a single STM transaction.
 asyncAfter :: TaskGroup -> [Handle] -> IO a -> IO (Async a)
 asyncAfter p parents t = atomically $ do
     child <- asyncUsing p rawForkIO t
     forM_ parents $ makeDependent (pool p) (taskHandle child)
     return child
 
--- | Execute an IO action, passing it a running pool with N available slots.
+withTaskGroupIn :: Pool -> Int -> (TaskGroup -> IO b) -> IO b
+withTaskGroupIn p n f = do
+    g <- createTaskGroup p n
+    Async.withAsync (runTaskGroup g) $ const $ f g `finally` cancelAll g
+
 withTaskGroup :: Int -> (TaskGroup -> IO b) -> IO b
 withTaskGroup n f = do
     p <- createPool
-    g <- createTaskGroup p n
-    Async.withAsync (runTaskGroup g) $ const $ f g `finally` cancelAll g
+    withTaskGroupIn p n f
 
 -- | Helper function used by several of the variants of 'mapTasks' below.
 mapTasksWorker :: Traversable t
