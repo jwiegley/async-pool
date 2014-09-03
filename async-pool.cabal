@@ -26,6 +26,8 @@ Library
       , stm
       , containers
       , transformers
+      , transformers-base
+      , monad-control
     exposed-modules:
         Control.Concurrent.Async.Pool
     other-modules:
@@ -46,6 +48,8 @@ test-suite test
       , async
       , stm
       , transformers
+      , transformers-base
+      , monad-control
       , fgl
       , containers
       , hspec                >= 1.4

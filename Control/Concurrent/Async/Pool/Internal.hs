@@ -1,64 +1,73 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 
 module Control.Concurrent.Async.Pool.Internal where
 
-import           Control.Applicative
+import           Control.Applicative (Applicative((<*>), pure), (<$>))
 import           Control.Arrow (first)
-import           Control.Concurrent
-import qualified Control.Concurrent.Async as Async
+import           Control.Concurrent (ThreadId)
+import qualified Control.Concurrent.Async as Async (withAsync)
 import           Control.Concurrent.Async.Pool.Async
 import           Control.Concurrent.STM
-import           Control.Exception
-import           Control.Monad hiding (forM, forM_, mapM, mapM_)
-import           Control.Monad.IO.Class
-import           Data.Foldable
-import           Data.Graph.Inductive.Graph as Gr hiding ((&))
+import           Control.Exception (SomeException, throwIO, finally)
+import           Control.Monad hiding (forM, forM_)
+import           Control.Monad.Base
+import           Control.Monad.IO.Class (MonadIO(..))
+import           Control.Monad.Trans.Control
+import           Data.Foldable (Foldable(foldMap), toList, forM_, all)
+import           Data.Graph.Inductive.Graph as Gr (Graph(empty))
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import           Data.List (delete)
-import           Data.Monoid
-import           Data.Traversable
+import           Data.Monoid (Monoid(mempty), (<>))
+import           Data.Traversable (Traversable(sequenceA), forM)
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
 
--- | Return a list of unlabeled nodes ready for execution.  This decreases the
---   number of available slots, but does not remove the nodes from the graph.
+-- | Return a list of actions ready for execution, by checking the graph to
+--   ensure that all dependencies have completed.
 getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     check (availSlots > 0)
     taskQueue  <- readTVar (pending p)
     check (not (IntMap.null taskQueue))
-    let readyNodes = IntMap.fromList $ take availSlots $ IntMap.toAscList
-                   $ IntMap.filterWithKey (const . isReady) taskQueue
+    let readyNodes = IntMap.fromList
+                   . take availSlots
+                   . IntMap.toAscList
+                   . IntMap.filterWithKey (const . isReady)
+                   $ taskQueue
     check (not (IntMap.null readyNodes))
     writeTVar (avail p) (availSlots - IntMap.size readyNodes)
     writeTVar (pending p) (taskQueue IntMap.\\ readyNodes)
     return readyNodes
   where
-    -- Returns True for every node for which there are no dependencies or
-    -- incomplete dependencies, and which is not itself a completed dependency.
-    -- The reason for the latter condition is that we keep completed nodes
-    -- with dependents in graph until their dependents have completed
-    -- (recursively), so that the dependent knows only to begin when its
-    -- parent has truly finished -- a fact which cannot be determined using
-    -- only the process map.
-    isReady x = all      isCompleted  (inn g x)
-              && all (not . isCompleted) (out g x)
+    isReady = all isCompleted . inn g
 
     isCompleted (_, _, Completed) = True
     isCompleted (_, _, _)         = False
 
--- | Return information about the list of tasks ready to execute, sufficient
---   to start them and remove them from the graph afterwards.
+-- | Return a list of tasks ready to execute, and their related state
+--   variables from the dependency graph.
 getReadyTasks :: TaskGroup -> STM [(TVar State, IO ThreadId)]
 getReadyTasks p = do
     g <- readTVar (tasks (pool p))
     map (first (getTaskVar g)) . IntMap.toList <$> getReadyNodes p g
 
--- | Begin executing tasks in the given pool.  The number of slots determines
---   how many threads may execute concurrently.  This number is adjustable
---   dynamically, by calling 'setPoolSlots', though reducing it does not cause
---   already active threads to stop.
+-- | Create a task pool for managing many-to-many acyclic dependencies among
+--   tasks.
+createPool :: IO Pool
+createPool = Pool <$> newTVarIO Gr.empty
+                  <*> newTVarIO 0
+
+-- | Create a task group for executing interdependent tasks concurrently.  The
+--   number of available slots governs how many tasks may run at one time.
+createTaskGroup :: Pool -> Int -> IO TaskGroup
+createTaskGroup p cnt = TaskGroup <$> pure p
+                                  <*> newTVarIO cnt
+                                  <*> newTVarIO mempty
+
+-- | Execute tasks in a given task group.  The number of slots determines how
+--   many threads may execute concurrently.
 runTaskGroup :: TaskGroup -> IO ()
 runTaskGroup p = forever $ do
     ready <- atomically $ do
@@ -68,76 +77,77 @@ runTaskGroup p = forever $ do
         check (not (null ready))
         forM_ ready $ \(tv, _) -> writeTVar tv Starting
         return ready
-
     forM_ ready $ \(tv, go) -> do
         t <- go
         atomically $ swapTVar tv $ Started t
 
--- | Create a task pool for managing many-to-many acyclic dependencies among
---   tasks.
-createPool :: IO Pool
-createPool =
-    Pool <$> newTVarIO Gr.empty
-         <*> newTVarIO 0
-
--- | Create a task group for executing interdependent tasks concurrently.  The
---   number of available slots governs how many tasks may run at one time.
-createTaskGroup :: Pool -> Int -> IO TaskGroup
-createTaskGroup p cnt =
-    TaskGroup <$> pure p
-              <*> newTVarIO cnt
-              <*> newTVarIO mempty
-
--- | Given parent and child task handles, link them so that the child cannot
---   execute until the parent has finished.  This does not check for cycles, so
---   can add new tasks in the time it takes to add a node and an edge into the
---   graph.
-unsafeMakeDependent :: Pool
-                    -> Handle    -- ^ Task doing the waiting
-                    -> Handle    -- ^ Task we must wait on (the parent)
-                    -> STM ()
-unsafeMakeDependent p child parent = do
-    g <- readTVar (tasks p)
-    -- If the parent is no longer in the graph, there is no need to establish
-    -- a dependency.  The child can begin executing in the next free slot.
-    when (gelem parent g) $
-        modifyTVar (tasks p) (insEdge (parent, child, Pending))
-
-makeDependent :: Pool
-              -> Handle    -- ^ Task doing the waiting
-              -> Handle    -- ^ Task we must wait on (the parent)
-              -> STM ()
-makeDependent p child parent = do
-    g <- readTVar (tasks p)
-    -- Check whether the parent is in any way dependent on the child, which
-    -- would introduce a cycle.
-    case esp child parent g of
-        -- If the parent is no longer in the graph, there is no need to
-        -- establish a dependency.  The child can begin executing in the next
-        -- free slot.
-        [] -> when (gelem parent g) $
-                 modifyTVar (tasks p) (insEdge (parent, child, Pending))
-
-        _ -> error "sequenceTasks: Attempt to introduce cycle in task graph"
-
--- | Submit a task, but only begin executing it once its parent has completed.
---   This is equivalent to submitting a new task and linking it to its parent
---   using 'makeDependent' within a single STM transaction.
-asyncAfter :: TaskGroup -> [Handle] -> IO a -> IO (Async a)
-asyncAfter p parents t = atomically $ do
-    child <- asyncUsing p rawForkIO t
-    forM_ parents $ makeDependent (pool p) (taskHandle child)
-    return child
-
+-- | Create a task group within the given pool having a specified number of
+--   execution slots, but with a bounded lifetime.  Leaving the block cancels
+--   every task still executing in the group.
 withTaskGroupIn :: Pool -> Int -> (TaskGroup -> IO b) -> IO b
 withTaskGroupIn p n f = do
     g <- createTaskGroup p n
     Async.withAsync (runTaskGroup g) $ const $ f g `finally` cancelAll g
 
+-- | Create both a pool and a task group with a given number of execution
+--   slots.
 withTaskGroup :: Int -> (TaskGroup -> IO b) -> IO b
 withTaskGroup n f = do
     p <- createPool
     withTaskGroupIn p n f
+
+-- | Given parent and child tasks, link them so the child cannot execute until
+--   the parent has finished.  This function does not check for cycles being
+--   introduced into the dependency graph, which would prevent a task from
+--   ever running.
+unsafeMakeDependent :: Pool
+                    -> Handle    -- ^ Handle of task doing the waiting
+                    -> Handle    -- ^ Handle of task we must wait on (the parent)
+                    -> STM ()
+unsafeMakeDependent p child parent = do
+    g <- readTVar (tasks p)
+    -- If the parent is no longer in the graph, there is no need to establish
+    -- dependency.  The child can begin executing in the next free slot.
+    when (gelem parent g) $
+        modifyTVar (tasks p) (insEdge (parent, child, Pending))
+
+-- | Given parent and child tasks, link them so the child cannot execute until
+--   the parent has finished.
+makeDependent :: Pool
+              -> Handle    -- ^ Handle of task doing the waiting
+              -> Handle    -- ^ Handle of task we must wait on (the parent)
+              -> STM ()
+makeDependent p child parent = do
+    g <- readTVar (tasks p)
+    -- Check whether the parent is in any way dependent on the child, which
+    -- would introduce a cycle.
+    when (gelem parent g) $
+        case esp child parent g of
+            -- If the parent is no longer in the graph, there is no need to
+            -- establish a dependency.  The child can begin executing in the
+            -- next free slot.
+            [] -> modifyTVar (tasks p) (insEdge (parent, child, Pending))
+            _  -> error "makeDependent: Cycle in task graph"
+
+-- | Equivalent to async, but acts in STM so that 'makeDependent' may be
+--   called after the task is created but before it may begin executing.
+asyncSTM :: TaskGroup -> IO a -> STM (Async a)
+asyncSTM p = asyncUsing p rawForkIO
+
+-- | Submit a task which begins executing after all its parents has completed.
+--   This is equivalent to submitting a new task with 'asyncSTM' and linking
+--   it to its parent using 'makeDependent'.
+asyncAfterAll :: TaskGroup -> [Handle] -> IO a -> IO (Async a)
+asyncAfterAll p parents t = atomically $ do
+    child <- asyncUsing p rawForkIO t
+    forM_ parents $ makeDependent (pool p) (taskHandle child)
+    return child
+
+-- | Submit a task which begins executing after its parent has completed.
+--   This is equivalent to submitting a new task with 'asyncSTM' and linking
+--   it to its parent using 'makeDependent'.
+asyncAfter :: TaskGroup -> Async b -> IO a -> IO (Async a)
+asyncAfter p parent = asyncAfterAll p [taskHandle parent]
 
 -- | Helper function used by several of the variants of 'mapTasks' below.
 mapTasksWorker :: Traversable t
@@ -150,36 +160,32 @@ mapTasksWorker p fs f g = do
     hs <- forM fs $ atomically . asyncUsing p rawForkIO
     f $ forM hs g
 
--- | Run a group of up to N tasks at a time concurrently, returning the
---   results in order.  The order of execution is random, but the results are
---   returned in order.  This version is more optimal than mapTasks in the
---   case where the Pool type is the same as the result type of each action.
+-- | Execute a group of tasks within the given pool, returning the results in
+--   order.  The order of execution is random, but the results are returned in
+--   order.
 mapTasks :: Traversable t => TaskGroup -> t (IO a) -> IO (t a)
 mapTasks p fs = mapTasksWorker p fs id wait
 
--- -- | Run a group of up to N tasks at a time concurrently, returning the
--- --   results in order.  The order of execution is random, but the results are
--- --   returned in order.
+-- | Execute a group of tasks within the given pool, returning the results in
+--   order as an Either type to represent exceptions from actions.  The order
+--   of execution is random, but the results are returned in order.
 mapTasksE :: Traversable t => TaskGroup -> t (IO a) -> IO (t (Either SomeException a))
 mapTasksE p fs = mapTasksWorker p fs id waitCatch
 
--- | Run a group of up to N tasks at a time concurrently, ignoring the
---   results.
+-- | Execute a group of tasks within the given pool, ignoring results.
 mapTasks_ :: Foldable t => TaskGroup -> t (IO a) -> IO ()
 mapTasks_ p fs = forM_ fs $ atomically . asyncUsing p rawForkIO
 
--- -- | Run a group of up to N tasks at a time concurrently, ignoring the
--- --   results, but returning whether an exception occurred for each task.
+-- | Execute a group of tasks within the given pool, ignoring results, but
+--   returning a list of all exceptions.
 mapTasksE_ :: Traversable t => TaskGroup -> t (IO a) -> IO (t (Maybe SomeException))
 mapTasksE_ p fs = mapTasksWorker p fs (fmap (fmap leftToMaybe)) waitCatch
   where
     leftToMaybe :: Either a b -> Maybe a
     leftToMaybe = either Just (const Nothing)
 
--- | Execute a group of tasks (where only N tasks at most may run,
---   corresponding to the number of available slots in the pool), returning
---   the first result or failure.  'Nothing' is returned if no tasks were
---   provided.
+-- | Execute a group of tasks, but return the first result or failure and
+--   cancel the remaining tasks.
 mapRace :: Foldable t
         => TaskGroup -> t (IO a) -> IO (Async a, Either SomeException a)
 mapRace p fs = do
@@ -187,25 +193,21 @@ mapRace p fs = do
     waitAnyCatchCancel hs
 
 -- | Given a list of actions yielding 'Monoid' results, execute the actions
---   concurrently (up to N at time, based on available slots), and also
---   mappend each pair of results concurrently as they become ready.
---
---   The immediate result from this function is Handle representing the final
---   task -- dependent on all the rest -- whose value is the final, aggregate
---   result.
+--   concurrently (up to N at time, based on available slots), and 'mappend'
+--   each pair of results concurrently as they become ready.  The immediate
+--   result of this function is an 'Async' representing the final value.
 --
 --   This is equivalent to the following: @mconcat <$> mapTasks n actions@,
 --   except that intermediate results can be garbage collected as soon as
---   they've merged.  Also, the value returned from this function is a
---   'Handle' which may be polled until that final result is ready.
+--   they've merged.  Also, the value returned from this function is a 'Async'
+--   which may be polled for the final result.
 --
---   Lastly, if any Exception occurs, the result obtained from waiting on or
---   polling the Handle will be one of those exceptions, but not necessarily the
---   first or the last.
+--   Lastly, if an 'Exception' occurs in any subtask, the final result will
+--   yield an exception, but not necessarily the first or last that was caught.
 mapReduce :: (Foldable t, Monoid a)
           => TaskGroup     -- ^ Pool to execute the tasks within
           -> t (IO a)      -- ^ Set of Monoid-yielding IO actions
-          -> STM (Async a) -- ^ Returns a Handle to the final result task
+          -> STM (Async a) -- ^ Returns the final result task
 mapReduce p fs = do
     -- Submit all the tasks right away, and jobs to combine all those results.
     -- Since we're working with a Monoid, it doesn't matter what order they
@@ -242,23 +244,28 @@ mapReduce p fs = do
             _  -> (t :) <$> squeeze xs
 
 -- | Execute a group of tasks concurrently (using up to N active threads,
---   depending on the pool), and feed results to the continuation immediately
---   as they become available, in whatever order they complete in.  That
---   function may return a monoid value which is accumulated to yield the
---   final result.
-scatterFoldM :: (Foldable t, Monoid b)
-             => TaskGroup -> t (IO a) -> (Either SomeException a -> IO b) -> IO b
-scatterFoldM p fs f = do
-    hs <- atomically $ sequenceA $ foldMap ((:[]) <$> asyncUsing p rawForkIO) fs
-    loop mempty (toList hs)
+--   depending on the pool), and feed results to a continuation as soon as
+--   they become available, in random order.  That function may return a
+--   monoid value which is accumulated to yield a final result.
+scatterFoldMapM :: (Foldable t, Monoid b, MonadBaseControl IO m)
+                => TaskGroup -> t (IO a) -> (Either SomeException a -> m b) -> m b
+scatterFoldMapM p fs f = do
+    hs <- liftBase $ atomically
+                  $ sequenceA
+                  $ foldMap ((:[]) <$> asyncUsing p rawForkIO) fs
+    control $ \run -> loop run (run $ return mempty) (toList hs)
   where
-    loop z [] = return z
-    loop z hs = do
+    loop _ z [] = z
+    loop run z hs = do
         (h, eres) <- atomically $ do
             mres <- foldM go Nothing hs
             maybe retry return mres
-        r <- f eres
-        loop (z <> r) (delete h hs)
+        r' <- z
+        r  <- run $ do
+            s <- restoreM r'
+            r <- f eres
+            return $ s <> r
+        loop run (return r) (delete h hs)
 
     go acc@(Just _) _ = return acc
     go acc h = do
@@ -273,9 +280,12 @@ scatterFoldM p fs f = do
 --   while applicative evaluation is done concurrently for each argument.
 newtype Task a = Task { runTask' :: TaskGroup -> IO (IO a) }
 
+-- | Run a value in the 'Task' monad and block until the final result is
+--   computed.
 runTask :: TaskGroup -> Task a -> IO a
 runTask group ts = join $ runTask' ts group
 
+-- | Lift any 'IO' action into a 'Task'.  This is a synonym for 'liftIO'.
 task :: IO a -> Task a
 task action = Task $ \_ -> return action
 

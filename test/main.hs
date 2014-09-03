@@ -128,7 +128,7 @@ main = hspec $ do
             threadDelay 50000
             atomically $ writeTVar x 42
             return 42
-        h2 <- asyncAfter p [taskHandle h1] $ do
+        h2 <- asyncAfter p h1 $ do
             y <- atomically $ readTVar x
             return $ y + 100
 
@@ -166,7 +166,7 @@ main = hspec $ do
         let go x = do
                 threadDelay (10000 * (x `mod` 3))
                 return $ Sum x
-        res <- scatterFoldM p (map go [1..20]) $ \ex ->
+        res <- scatterFoldMapM p (map go [1..20]) $ \ex ->
             case ex of
                 Left e  -> mempty <$ print ("Hmmm... " ++ show e)
                 Right x -> return x

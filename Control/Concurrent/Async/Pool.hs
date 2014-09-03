@@ -1,13 +1,24 @@
 module Control.Concurrent.Async.Pool
     (
-
     -- * Asynchronous actions
     Async,
-    -- ** Spawning
+
+    -- * Task pools and groups
+    withTaskGroup, withTaskGroupIn,
+    Pool, createPool,
+    TaskGroup, createTaskGroup, runTaskGroup,
+
+    -- ** Spawning tasks
     async, asyncBound, asyncOn, asyncWithUnmask, asyncOnWithUnmask,
+    asyncSTM,
+
+    -- ** Dependent tasks
+    taskHandle, asyncAfter, asyncAfterAll,
+    makeDependent, unsafeMakeDependent,
 
     -- ** Spawning with automatic 'cancel'ation
-    withAsync, withAsyncBound, withAsyncOn, withAsyncWithUnmask, withAsyncOnWithUnmask,
+    withAsync, withAsyncBound, withAsyncOn, withAsyncWithUnmask,
+    withAsyncOnWithUnmask,
 
     -- ** Quering 'Async's
     wait, poll, waitCatch, cancel, cancelWith,
@@ -24,13 +35,17 @@ module Control.Concurrent.Async.Pool
     -- ** Linking
     link, link2,
 
-    -- * Convenient utilities
-    race, race_, concurrently, mapConcurrently,
-    Concurrently(..),
+    -- ** Lists of actions
+    mapTasks, mapTasks_, mapTasksE, mapTasksE_,
+    mapRace, mapReduce,
+    scatterFoldMapM,
 
-    Pool, createPool, createTaskGroup, runTaskGroup, withTaskGroup,
+    -- ** The Task Monad and Applicative
+    Task, runTask, task,
 
-    asyncAfter, makeDependent, taskHandle
+    -- * Other utilities
+    race, race_,
+    concurrently, mapConcurrently, Concurrently(..)
     ) where
 
 import Control.Concurrent.Async.Pool.Async
