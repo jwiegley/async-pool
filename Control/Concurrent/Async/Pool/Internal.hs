@@ -277,7 +277,9 @@ scatterFoldMapM p fs f = do
 
 -- | The 'Task' Applicative and Monad allow for task dependencies to be built
 --   using applicative and do notation.  Monadic evaluation is sequenced,
---   while applicative evaluation is done concurrently for each argument.
+--   while applicative evaluation is done concurrently for each argument.  In
+--   this way, mixing the two allows you to build a dependency tree using
+--   ordinary Haskell code.
 newtype Task a = Task { runTask' :: TaskGroup -> IO (IO a) }
 
 -- | Run a value in the 'Task' monad and block until the final result is
