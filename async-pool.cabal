@@ -27,7 +27,7 @@ Library
       , containers
       , transformers
       , transformers-base
-      , monad-control
+      , monad-control >= 1.0 && < 1.1
     exposed-modules:
         Control.Concurrent.Async.Pool
     other-modules:

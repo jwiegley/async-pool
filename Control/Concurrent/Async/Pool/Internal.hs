@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Control.Concurrent.Async.Pool.Internal where
 
@@ -251,7 +252,7 @@ scatterFoldMapM p fs f = do
     hs <- liftBase $ atomically
                   $ sequenceA
                   $ foldMap ((:[]) <$> asyncUsing p rawForkIO) fs
-    control $ \run -> loop run (run $ return mempty) (toList hs)
+    control $ \(run :: m b -> IO (StM m b)) -> loop run (run $ return mempty) (toList hs)
   where
     loop _ z [] = z
     loop run z hs = do
