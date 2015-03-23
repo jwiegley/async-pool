@@ -5,7 +5,7 @@
 
 cabal.mkDerivation (self: {
   pname = "async-pool";
-  version = "0.1.0";
+  version = "0.9.0";
   src = builtins.filterSource (path: type: type != "unknown") ./.;
   buildDepends = [ async fgl stm transformers transformersBase monadControl ];
   testDepends = [ async fgl hspec stm time transformers ];

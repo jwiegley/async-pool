@@ -1,5 +1,5 @@
 Name:           async-pool
-Version:        0.8.0
+Version:        0.9.0
 Synopsis:       A modified version of async that supports worker groups and many-to-many task dependencies
 License-file:   LICENSE
 License:        MIT
