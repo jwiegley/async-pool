@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, MagicHash, UnboxedTuples, RankNTypes #-}
+{-# LANGUAGE CPP, MagicHash, UnboxedTuples, RankNTypes, GADTs #-}
 #if __GLASGOW_HASKELL__ >= 701
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -107,9 +107,20 @@ import GHC.Conc
 
 -- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
-data State     = Ready | Starting | Started ThreadId deriving (Eq, Show)
+data State     = Ready | Starting | forall a. Started ThreadId (TMVar a)
 data Status    = Pending | Completed deriving (Eq, Show)
 type TaskGraph = Gr (TVar State) Status
+
+instance Eq State where
+    Ready        == Ready        = True
+    Starting     == Starting     = True
+    Started n1 _ == Started n2 _ = n1 == n2
+    _            == _            = False
+
+instance Show State where
+    show Ready         = "Ready"
+    show Starting      = "Starting"
+    show (Started n _) = "Started " ++ show n
 
 -- | A 'Pool' manages a collection of possibly interdependent tasks, such that
 --   tasks await execution until the tasks they depend on have finished (and
@@ -141,11 +152,25 @@ data Pool = Pool
       -- ^ Tokens identify tasks, and are provisioned monotonically.
     }
 
+waitTMVar :: TMVar a -> STM ()
+waitTMVar tv = do
+    _ <- readTMVar tv
+    return ()
+
+syncPool :: Pool -> STM ()
+syncPool p = do
+    g <- readTVar (tasks p)
+    forM_ (labNodes g) $ \(_h, st) -> do
+        x <- readTVar st
+        case x of
+            Started _tid v -> waitTMVar v
+            _ -> retry
+
 data TaskGroup = TaskGroup
     { pool    :: Pool
     , avail   :: TVar Int
       -- ^ The number of available execution slots in the pool.
-    , pending :: TVar (IntMap (IO ThreadId))
+    , pending :: forall a. TVar (IntMap (IO ThreadId, TMVar a))
       -- ^ Nodes in the task graph that are waiting to start.
     }
 
@@ -171,9 +196,9 @@ getThreadId :: TaskGraph -> Node -> STM (Maybe ThreadId)
 getThreadId g h = do
     status <- readTVar (getTaskVar g h)
     case status of
-        Ready     -> return Nothing
-        Starting  -> retry
-        Started x -> return $ Just x
+        Ready       -> return Nothing
+        Starting    -> retry
+        Started x _ -> return $ Just x
 
 instance Eq (Async a) where
   Async _ a _ == Async _ b _  =  a == b
@@ -218,7 +243,7 @@ asyncUsing p doFork action = do
             doFork $ try (restore (action `finally` cleanup h))
                 >>= atomically . putTMVar var
 
-    modifyTVar (pending p) (IntMap.insert h start)
+    modifyTVar (pending p) (IntMap.insert h (start, var))
     tv <- newTVar Ready
     modifyTVar (tasks (pool p)) (insNode (h, tv))
 

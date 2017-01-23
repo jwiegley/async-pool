@@ -23,10 +23,11 @@ import           Data.List (delete)
 import           Data.Monoid (Monoid(mempty), (<>))
 import           Data.Traversable (Traversable(sequenceA), forM)
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
+import           Unsafe.Coerce
 
 -- | Return a list of actions ready for execution, by checking the graph to
 --   ensure all dependencies have completed.
-getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId))
+getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId, TMVar a))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     check (availSlots > 0)
@@ -49,7 +50,7 @@ getReadyNodes p g = do
 
 -- | Return a list of tasks ready to execute, and their related state
 --   variables from the dependency graph.
-getReadyTasks :: TaskGroup -> STM [(TVar State, IO ThreadId)]
+getReadyTasks :: TaskGroup -> STM [(TVar State, (IO ThreadId, TMVar a))]
 getReadyTasks p = do
     g <- readTVar (tasks (pool p))
     map (first (getTaskVar g)) . IntMap.toList <$> getReadyNodes p g
@@ -60,12 +61,23 @@ createPool :: IO Pool
 createPool = Pool <$> newTVarIO Gr.empty
                   <*> newTVarIO 0
 
+-- | Use a task pool for a bounded region. At the end of the region,
+-- 'withPool' will block until all tasks have completed.
+withPool :: (Pool -> IO a) -> IO a
+withPool f = do
+    p <- createPool
+    x <- f p
+    atomically $ syncPool p
+    return x
+
 -- | Create a task group for executing interdependent tasks concurrently.  The
 --   number of available slots governs how many tasks may run at one time.
 createTaskGroup :: Pool -> Int -> IO TaskGroup
-createTaskGroup p cnt = TaskGroup <$> pure p
-                                  <*> newTVarIO cnt
-                                  <*> newTVarIO mempty
+createTaskGroup p cnt = do
+    c <- newTVarIO cnt
+    m <- newTVarIO IntMap.empty
+    -- Prior to GHC 8, this call to unsafeCoerce was not necessary.
+    return $ TaskGroup p c (unsafeCoerce m)
 
 -- | Execute tasks in a given task group.  The number of slots determines how
 --   many threads may execute concurrently.
@@ -78,9 +90,9 @@ runTaskGroup p = forever $ do
         check (not (null ready))
         forM_ ready $ \(tv, _) -> writeTVar tv Starting
         return ready
-    forM_ ready $ \(tv, go) -> do
+    forM_ ready $ \(tv, (go, var)) -> do
         t <- go
-        atomically $ swapTVar tv $ Started t
+        atomically $ swapTVar tv $ Started t var
 
 -- | Create a task group within the given pool having a specified number of
 --   execution slots, but with a bounded lifetime.  Leaving the block cancels
