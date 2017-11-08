@@ -20,7 +20,7 @@ Library
     default-language: Haskell98
     ghc-options:      -Wall
     build-depends:
-        base >= 3 && < 4.10
+        base >= 3 && < 4.11
       , fgl
       , async
       , stm
