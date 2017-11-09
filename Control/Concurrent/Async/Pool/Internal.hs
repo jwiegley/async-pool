@@ -286,6 +286,18 @@ scatterFoldMapM p fs f = do
             Just (Left e)  -> Just (h, Left e)
             Just (Right x) -> Just (h, Right x)
 
+-- | maps an @IO@-performing function over any @Traversable@ data
+-- type, performing all the @IO@ actions concurrently, and returning
+-- the original data structure with the arguments replaced by the
+-- results.
+--
+-- For example, @mapConcurrently@ works with lists:
+--
+-- > pages <- mapConcurrently getURL ["url1", "url2", "url3"]
+--
+mapConcurrently :: Traversable t => TaskGroup -> (a -> IO b) -> t a -> IO (t b)
+mapConcurrently tg f = mapTasks tg . fmap f
+
 -- | The 'Task' Applicative and Monad allow for task dependencies to be built
 --   using Applicative and do notation.  Monadic evaluation is sequenced,
 --   while applicative Evaluation is concurrent for each argument.  In this
