@@ -5,11 +5,11 @@ mkDerivation {
   pname = "async-pool";
   version = "0.9.0.2";
   src = ./.;
-  buildDepends = [
+  libraryHaskellDepends = [
     async base containers fgl monad-control stm transformers
     transformers-base
   ];
-  testDepends = [
+  testHaskellDepends = [
     async base containers fgl hspec monad-control stm time transformers
     transformers-base
   ];
