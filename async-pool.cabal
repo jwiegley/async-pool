@@ -20,14 +20,14 @@ Library
     default-language: Haskell98
     ghc-options:      -Wall
     build-depends:
-        base >= 3 && < 4.13
-      , fgl
-      , async
-      , stm
-      , containers
+        base               >= 4.6     && < 4.13
+      , fgl                >= 5.4.2.2
+      , async              >= 2.0.0.0
+      , stm                >= 2.3
+      , containers         >= 0.5.0.0
       , transformers
       , transformers-base
-      , monad-control >= 1.0 && < 1.1
+      , monad-control      >= 1.0     && < 1.1
     exposed-modules:
         Control.Concurrent.Async.Pool
     other-modules:
