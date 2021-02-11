@@ -99,7 +99,7 @@ module Control.Concurrent.Async.Pool
     withAsyncOnWithUnmask,
 
     -- ** Quering 'Async's
-    wait, poll, waitCatch, cancel, cancelWith,
+    wait, poll, waitCatch, cancel, cancelWith, cancelAll,
 
     -- ** STM operations
     waitSTM, pollSTM, waitCatchSTM,
