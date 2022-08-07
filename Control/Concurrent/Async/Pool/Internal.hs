@@ -101,7 +101,9 @@ withTaskGroupIn :: Pool -> Int -> (TaskGroup -> IO b) -> IO b
 withTaskGroupIn p n f = createTaskGroup p n >>= \g ->
     Async.withAsync (runTaskGroup g) $ const $ f g `finally` cancelAll g
 
--- | Create both a pool, and a task group with a given number of execution slots.
+-- | Create both a pool, and a task group with a given number of execution slots,
+--   but with a bounded lifetime. Once the given function exits, all tasks (that 
+--   are still running) in the TaskGroup will be cancelled.
 withTaskGroup :: Int -> (TaskGroup -> IO b) -> IO b
 withTaskGroup n f = createPool >>= \p -> withTaskGroupIn p n f
 
