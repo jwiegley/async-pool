@@ -107,7 +107,7 @@ import GHC.Conc
 
 -- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
-data State     = Ready | Starting | forall a. Started ThreadId (TMVar a)
+data State     = Ready | Starting | Started ThreadId (SomeTMVar)
 data Status    = Pending | Completed deriving (Eq, Show)
 type TaskGraph = Gr (TVar State) Status
 
@@ -163,14 +163,20 @@ syncPool p = do
     forM_ (labNodes g) $ \(_h, st) -> do
         x <- readTVar st
         case x of
-            Started _tid v -> waitTMVar v
+            Started _tid v -> waitSomeTMVar v
             _ -> retry
+
+data SomeTMVar where
+    SomeTMVar :: forall a. TMVar a -> SomeTMVar
+
+waitSomeTMVar :: SomeTMVar -> STM ()
+waitSomeTMVar (SomeTMVar mv) = waitTMVar mv
 
 data TaskGroup = TaskGroup
     { pool    :: Pool
     , avail   :: TVar Int
       -- ^ The number of available execution slots in the pool.
-    , pending :: forall a. TVar (IntMap (IO ThreadId, TMVar a))
+    , pending :: TVar (IntMap (IO ThreadId, SomeTMVar))
       -- ^ Nodes in the task graph that are waiting to start.
     }
 
@@ -243,7 +249,7 @@ asyncUsing p doFork action = do
             doFork $ try (restore (action `finally` cleanup h))
                 >>= atomically . putTMVar var
 
-    modifyTVar (pending p) (IntMap.insert h (start, var))
+    modifyTVar (pending p) (IntMap.insert h (start, SomeTMVar var))
     tv <- newTVar Ready
     modifyTVar (tasks (pool p)) (insNode (h, tv))
 
