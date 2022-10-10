@@ -10,7 +10,7 @@ import           Control.Concurrent (ThreadId)
 import qualified Control.Concurrent.Async as Async (withAsync)
 import           Control.Concurrent.Async.Pool.Async
 import           Control.Concurrent.STM
-import           Control.Exception (SomeException, throwIO, finally)
+import           Control.Exception (SomeException, throwIO, finally, bracket_)
 import           Control.Monad hiding (forM, forM_)
 import           Control.Monad.Base
 import           Control.Monad.IO.Class (MonadIO(..))
@@ -23,11 +23,10 @@ import           Data.List (delete)
 import           Data.Monoid (Monoid(mempty), (<>))
 import           Data.Traversable (Traversable(sequenceA), forM)
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
-import           Unsafe.Coerce
 
 -- | Return a list of actions ready for execution, by checking the graph to
 --   ensure all dependencies have completed.
-getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId, TMVar a))
+getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId, SomeTMVar))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     check (availSlots > 0)
@@ -50,7 +49,7 @@ getReadyNodes p g = do
 
 -- | Return a list of tasks ready to execute, and their related state
 --   variables from the dependency graph.
-getReadyTasks :: TaskGroup -> STM [(TVar State, (IO ThreadId, TMVar a))]
+getReadyTasks :: TaskGroup -> STM [(TVar State, (IO ThreadId, SomeTMVar))]
 getReadyTasks p = do
     g <- readTVar (tasks (pool p))
     map (first (getTaskVar g)) . IntMap.toList <$> getReadyNodes p g
@@ -76,8 +75,7 @@ createTaskGroup :: Pool -> Int -> IO TaskGroup
 createTaskGroup p cnt = do
     c <- newTVarIO cnt
     m <- newTVarIO IntMap.empty
-    -- Prior to GHC 8, this call to unsafeCoerce was not necessary.
-    return $ TaskGroup p c (unsafeCoerce m)
+    return $ TaskGroup p c m
 
 -- | Execute tasks in a given task group.  The number of slots determines how
 --   many threads may execute concurrently.
@@ -160,6 +158,9 @@ asyncAfterAll p parents t = atomically $ do
 asyncAfter :: TaskGroup -> Async b -> IO a -> IO (Async a)
 asyncAfter p parent = asyncAfterAll p [taskHandle parent]
 
+extraWorkerWhileBlocked :: TaskGroup -> IO a -> IO a
+extraWorkerWhileBlocked p = bracket_ (atomically $ modifyTVar' (avail p) (+ 1)) (atomically $ modifyTVar' (avail p) ((-) 1))
+
 -- | Helper function used by several of the variants of 'mapTasks' below.
 mapTasksWorker :: Traversable t
                => TaskGroup
@@ -169,7 +170,7 @@ mapTasksWorker :: Traversable t
                -> IO (t c)
 mapTasksWorker p fs f g = do
     hs <- forM fs $ atomically . asyncUsingLazy p rawForkIO
-    f $ forM hs g
+    extraWorkerWhileBlocked p $ f $ forM hs g
 
 -- | Execute a group of tasks within the given task group, returning the
 --   results in order.  The order of execution is random, but the results are

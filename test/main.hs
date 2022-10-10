@@ -191,3 +191,7 @@ main = hspec $ do
           end <- getCurrentTime
           let diff = diffUTCTime end start
           diff < 1.2 `shouldBe` True
+
+      it "nested mapTasks work" $ withTaskGroup 1 $ \p -> do
+          mapTasks p ([mapTasks p [pure ()]])
+          True `shouldBe` True
