@@ -23,11 +23,10 @@ import           Data.List (delete)
 import           Data.Monoid (Monoid(mempty), (<>))
 import           Data.Traversable (Traversable(sequenceA), forM)
 import           Prelude hiding (mapM_, mapM, foldr, all, any, concatMap, foldl1)
-import           Unsafe.Coerce
 
 -- | Return a list of actions ready for execution, by checking the graph to
 --   ensure all dependencies have completed.
-getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId, TMVar a))
+getReadyNodes :: TaskGroup -> TaskGraph -> STM (IntMap (IO ThreadId, SomeTMVar))
 getReadyNodes p g = do
     availSlots <- readTVar (avail p)
     check (availSlots > 0)
@@ -50,7 +49,7 @@ getReadyNodes p g = do
 
 -- | Return a list of tasks ready to execute, and their related state
 --   variables from the dependency graph.
-getReadyTasks :: TaskGroup -> STM [(TVar State, (IO ThreadId, TMVar a))]
+getReadyTasks :: TaskGroup -> STM [(TVar State, (IO ThreadId, SomeTMVar))]
 getReadyTasks p = do
     g <- readTVar (tasks (pool p))
     map (first (getTaskVar g)) . IntMap.toList <$> getReadyNodes p g
@@ -76,8 +75,7 @@ createTaskGroup :: Pool -> Int -> IO TaskGroup
 createTaskGroup p cnt = do
     c <- newTVarIO cnt
     m <- newTVarIO IntMap.empty
-    -- Prior to GHC 8, this call to unsafeCoerce was not necessary.
-    return $ TaskGroup p c (unsafeCoerce m)
+    return $ TaskGroup p c m
 
 -- | Execute tasks in a given task group.  The number of slots determines how
 --   many threads may execute concurrently.
