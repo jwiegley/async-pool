@@ -259,6 +259,13 @@ asyncUsing p doFork action = do
         modifyTVar (avail p) succ
         cleanupTask (pool p) h
 
+-- | Like 'asyncUsing' but waits until there are free slots in the TaskGroup
+asyncUsingLazy :: TaskGroup -> (IO () -> IO ThreadId) -> IO a -> STM (Async a)
+asyncUsingLazy p doFork action = do
+    availSlots <- readTVar (avail p)
+    check (availSlots > 0)
+    asyncUsing p doFork action
+
 -- | Return the next available thread identifier from the pool.  These are
 --   monotonically increasing integers.
 nextIdent :: Pool -> STM Int
