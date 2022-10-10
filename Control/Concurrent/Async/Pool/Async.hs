@@ -107,7 +107,7 @@ import GHC.Conc
 
 -- | A 'Handle' is a unique identifier for a task submitted to a 'Pool'.
 type Handle    = Node
-data State     = Ready | Starting | Started ThreadId (SomeTMVar)
+data State     = Ready | Starting | Started ThreadId SomeTMVar
 data Status    = Pending | Completed deriving (Eq, Show)
 type TaskGraph = Gr (TVar State) Status
 
